@@ -74,6 +74,20 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   enumerator constant, and an optional sign; no arithmetic yet). Enum
   variables, parameters, and results behave as `int`. Anonymous enums define
   constants without a tag; named tags are reusable as `enum Tag`.
+- Struct and union types: `struct`/`union` tags with block scoping and
+  same-scope redefinition checks. Members are scalar, pointer, array, or
+  nested record types with target-correct size, alignment, member offsets,
+  and padding. Incomplete tagged types support pointers to self-referential
+  records (`struct Node { struct Node *next; ... };`), and tags are reusable
+  as `struct Tag` after their definition. Member access uses `.` on record
+  lvalues and `->` through pointers, preserving lvalues so member addresses
+  and members of array rows work. Aggregate assignment copies byte by byte,
+  including self-assignment; aggregates are not supported as parameters,
+  results, or global initializers, and member offsets must fit a 12-bit
+  immediate. Anonymous records and unions nested in members are supported.
+- `sizeof(type)` yields the type's size as an `unsigned long` without
+  runtime evaluation; the parenthesized form takes a type (specifiers and
+  `*` forms), not an expression.
 - File-scope and block-scope `typedef` aliases for supported types, including
   fixed-size arrays and `void`. Aliases share the ordinary identifier namespace
   and obey block shadowing. Comma-separated declarators share one declaration's
@@ -86,7 +100,9 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   the wider types, `L`/`U` suffixes; pointer initializers accept zero. Matching
   tentative declarations may repeat, with at most one initialized definition.
   Up to 256 file-scope objects, typedef names, and enumerator constants
-  combined are supported. Global arrays, `extern`, `static`, address
+  combined are supported. Global one-dimensional and multidimensional arrays
+  and complete records are zero-initialized in `.data` without the local
+  frame limit; global aggregate initializers, `extern`, `static`, address
   initializers, and general constant expressions remain unsupported.
 - User-defined functions returning `void`, `_Bool`, `char`, `int`,
   `unsigned`, `long`, `unsigned long`, or a pointer, with zero to eight
@@ -94,7 +110,8 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   including recursion and mutual recursion through forward prototypes. Functions
   must be declared or defined before a call; a definition declares the function
   before its own body is parsed. Up to 256 distinct function names are supported.
-- Scalar locals and one-dimensional fixed-size arrays in nested blocks, up to 256 simultaneously active
+- Scalar locals, one-dimensional and multidimensional fixed-size arrays, and
+  complete records in nested blocks, up to 256 simultaneously active
   locals including parameters and block-scope typedef names. Inner blocks may shadow outer names; sibling
   blocks reuse stack slots. Parameters can be assigned like local variables.
   Scalar initializers are optional; reading an uninitialized value remains
@@ -109,10 +126,14 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   by an `int` scales by element size and handles negative indexes. Compatible
   pointers support `==`, `!=`, and truth tests; literal `0` is accepted as a null
   pointer constant (also parenthesized or with unary `+`/`-`).
-- Explicit-size array declarations such as `int a[4]`, brace initializers such as
+- Explicit-size array declarations such as `int a[4]` and multidimensional
+  forms such as `int a[3][4]` or `typedef int Grid[4][5]`, with row-major
+  indexing. Brace initializers such as
   `int a[4] = {1, 2}`, and string initializers such as `char s[] = "hello"` or
   `char s[8] = "hello"`. Omitted initializer elements are zero-filled. Array
-  parameters such as `char s[]` are adjusted to pointers.
+  parameters such as `char s[]` or `Arr_2_Dim rows` are adjusted to pointers
+  to the element type, so multidimensional parameters become row pointers
+  and row indexing scales by the row size.
 - Decimal literals with optional `L`/`l` and `U`/`u` suffixes (combined for
   `unsigned long`), local references, parentheses,
   and unary `+` and `-`. Unsuffixed values must fit `int`; `U` values must fit
@@ -157,14 +178,17 @@ directives are not supported yet.
 Multiplication, division, other binary operators, compound assignments (`+=`),
 increment/decrement, logical operators (`!`, `&&`, `||`), `break`, `continue`,
 `for`, function pointers, variadic calls, more than eight parameters,
-and floating point remain future work. Global arrays, `const`,
-`void` objects/pointers, `sizeof`, multidimensional array declarations,
-and parenthesized declarators are not supported yet. Neither are pointer ordering,
+and floating point remain future work. `const`,
+`void` objects/pointers, and parenthesized declarators are not supported yet.
+Neither are pointer ordering,
 pointer-to-pointer subtraction, or general computed null pointer constants.
 Scalar self-initializer reads, enumerator arithmetic in initializers,
 and the literal expression `-2147483648` are also
 outside this subset. Array lengths must be decimal literals; an omitted length
-is supported only for a string initializer or array parameter.
+is supported only for a string initializer or array parameter. Aggregate
+values are not supported as function parameters, results, or global
+initializers; struct copy semantics follow a forward byte loop, so partially
+overlapping copies other than exact self-assignment are not promised.
 Unsupported syntax is rejected rather than passed to the host compiler.
 
 The emitter uses stack slots for locals, 32-bit integer operations, byte loads and
@@ -198,7 +222,9 @@ Integer constants reside in a literal pool after the function. Strings use
 `ADRP`/`ADD` with Linux or macOS page relocations. Pointer indexing extends
 the integer index (`sxtw`, or `uxtw` for unsigned types) and uses shifted `ADD`
 forms to scale it, retaining the
-12-mnemonic vocabulary. A conservative code-size
+12-mnemonic vocabulary. Member access adds constant member offsets through
+the frame or global address; aggregate assignment copies bytes through a
+`CBZ`-terminated register-offset loop. A conservative code-size
 limit keeps literal loads and return branches in range. Unwind metadata is not
 implemented yet.
 
@@ -222,6 +248,11 @@ characters, and pointers, comma-separated declarators for locals, globals, and
 typedef aliases with per-declarator suffixes, `long`/`unsigned long` boundaries
 and usual arithmetic conversions, unsigned ordering, and casts across the
 scalar types, plus cross-ABI calls passing `long` and `_Bool` values.
+Aggregate tests cover struct and union layout against system-compiled sizes,
+member access with `.` and `->`, nested anonymous records, union aliasing,
+member addresses, struct and self-assignment, multidimensional arrays with
+row-major indexing and row-pointer arithmetic, `sizeof`, and zero-initialized
+global arrays and records.
 On Linux with `objdump`, it audits
 the actual machine instructions in generated functions, disabling disassembler aliases so
 `ADD x29, sp, #0` is not displayed as `MOV`. Native execution tests are skipped on

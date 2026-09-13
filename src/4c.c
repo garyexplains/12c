@@ -21,16 +21,37 @@ typedef struct {
 } Token;
 
 typedef enum { TY_BOOL, TY_CHAR, TY_INT, TY_UINT, TY_LONG, TY_ULONG,
-               TY_PTR, TY_ARRAY, TY_VOID } TypeKind;
+                TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_VOID } TypeKind;
+typedef struct Member Member;
 typedef struct Type {
     TypeKind kind;
     struct Type *base;
     int size;
+    int align;
+    Member *members;
+    int nmembers;
 } Type;
-static Type void_type = {TY_VOID, NULL, 0};
-static Type int_type = {TY_INT, NULL, 4}, char_type = {TY_CHAR, NULL, 1};
-static Type bool_type = {TY_BOOL, NULL, 1}, uint_type = {TY_UINT, NULL, 4};
-static Type long_type = {TY_LONG, NULL, 8}, ulong_type = {TY_ULONG, NULL, 8};
+typedef struct Member {
+    char *name;
+    Type *type;
+    int offset;
+} Member;
+static Type void_type = {TY_VOID, NULL, 0, 1, NULL, 0};
+static Type int_type = {TY_INT, NULL, 4, 4, NULL, 0},
+            char_type = {TY_CHAR, NULL, 1, 1, NULL, 0};
+static Type bool_type = {TY_BOOL, NULL, 1, 1, NULL, 0},
+            uint_type = {TY_UINT, NULL, 4, 4, NULL, 0};
+static Type long_type = {TY_LONG, NULL, 8, 8, NULL, 0},
+            ulong_type = {TY_ULONG, NULL, 8, 8, NULL, 0};
+static int alignment(Type *t) {
+    switch (t->kind) {
+    case TY_PTR: case TY_LONG: case TY_ULONG: return 8;
+    case TY_INT: case TY_UINT: return 4;
+    case TY_ARRAY: return alignment(t->base);
+    case TY_STRUCT: case TY_UNION: return t->align;
+    default: return 1; /* TY_BOOL, TY_CHAR, TY_VOID */
+    }
+}
 typedef struct { Type *type; int lvalue, local, zero; } Expr;
 typedef struct { unsigned char *data; size_t length; } String;
 static String *strings;
@@ -85,7 +106,8 @@ static int type_start(void) {
     return !strcmp(s, "int") || !strcmp(s, "char") ||
            !strcmp(s, "void") || !strcmp(s, "_Bool") ||
            !strcmp(s, "long") || !strcmp(s, "unsigned") ||
-           !strcmp(s, "enum") || alias_type(s) != NULL;
+           !strcmp(s, "enum") || !strcmp(s, "struct") ||
+           !strcmp(s, "union") || alias_type(s) != NULL;
 }
 typedef struct {
     char *name;
@@ -217,6 +239,10 @@ static void lex(const char *path, int depth) {
             do { ++p; } while (isalnum((unsigned char)*p) || *p == '_');
         } else if ((strchr("=!<>", p[0]) && p[1] == '=')) {
             p += 2;
+        } else if (p[0] == '-' && p[1] == '>') {
+            p += 2;
+        } else if (*p == '.') {
+            ++p;
         } else if (strchr("(){}[];=,+-<>*&", *p)) {
             if ((p[0] == '+' && p[1] == '+') || (p[0] == '-' && p[1] == '-'))
                 fatal("%s:%d: increment and decrement are not supported", path, line);
@@ -274,13 +300,43 @@ static char *name(void) {
 
 static Type *derived(TypeKind kind, Type *base, int size) {
     Type *t = resize(NULL, sizeof(*t));
-    *t = (Type){kind, base, size};
+    *t = (Type){kind, base, size, 0, NULL, 0};
     return t;
 }
 static Type *pointer(Type *base) { return derived(TY_PTR, base, 8); }
 static int same_type(Type *a, Type *b) {
     return a->kind == b->kind && a->size == b->size &&
            (!a->base || same_type(a->base, b->base));
+}
+static void add_member(Type *t, char *name, Type *type) {
+    for (int i = 0; i < t->nmembers; ++i)
+        if (!strcmp(t->members[i].name, name)) error("duplicate member");
+    t->members = resize(t->members, ((size_t)t->nmembers + 1) * sizeof(Member));
+    t->members[t->nmembers++] = (Member){name, type, 0};
+}
+static Member *find_member(Type *t, const char *name) {
+    for (int i = 0; i < t->nmembers; ++i)
+        if (!strcmp(t->members[i].name, name)) return &t->members[i];
+    return NULL;
+}
+/* Assign offsets, size, and alignment for a struct or union body. */
+static void layout_record(Type *t, int is_union) {
+    int max_size = 0, max_align = 0, offset = 0;
+    for (int i = 0; i < t->nmembers; ++i) {
+        Member *m = &t->members[i];
+        int a = alignment(m->type);
+        if (a > max_align) max_align = a;
+        if (is_union) {
+            m->offset = 0;
+        } else {
+            offset = (offset + a - 1) & ~(a - 1);
+            m->offset = offset;
+            offset += m->type->size;
+        }
+        if (m->type->size > max_size) max_size = m->type->size;
+    }
+    t->align = max_align ? max_align : 1;
+    t->size = is_union ? max_size : (offset + t->align - 1) & ~(t->align - 1);
 }
 static int integer(Type *t) {
     switch (t->kind) {
@@ -412,6 +468,50 @@ static Type *enum_specifier(void) {
     expect("}");
     return &int_type;
 }
+/* struct-or-union-specifier: ('struct'|'union') [tag] ['{' members '}'].
+   A named tag is registered before its members are parsed so that
+   pointers to the record inside its own body (self-reference) work; the
+   type node starts incomplete (size 0) and is filled in after layout. */
+static Type *parse_specs(void);
+static Type *consume_stars(Type *t);
+static Type *array_suffix(Type *t, int parameter, int global);
+static Type *struct_specifier(int is_union) {
+    char *tag = NULL;
+    if (identifier(current()->text)) tag = tokens[pos++].text;
+    if (!take("{")) {
+        if (!tag) error("expected a struct tag or member list");
+        int existing = find_tag(tag);
+        if (existing < 0) error("unknown struct tag");
+        return tags[existing].type;
+    }
+    Type *t = derived(is_union ? TY_UNION : TY_STRUCT, NULL, 0);
+    if (tag) {
+        int existing = find_tag(tag);
+        if (existing >= 0 && tags[existing].depth == tag_depth)
+            error("duplicate struct tag");
+        if (ntags == 256) error("too many struct tags");
+        tags[ntags++] = (Tag){tag, t, tag_depth};
+    }
+    while (strcmp(current()->text, "}")) {
+        if (!strcmp(current()->text, "<eof>"))
+            error("expected '}' after struct body");
+        Type *base = parse_specs();
+        for (;;) {
+            Type *mt = consume_stars(base);
+            char *s = name();
+            mt = array_suffix(mt, 0, 1);
+            if (mt->kind == TY_VOID) error("member cannot have void type");
+            if (!mt->size) error("member has incomplete type");
+            add_member(t, s, mt);
+            if (!take(",")) break;
+        }
+        expect(";");
+    }
+    expect("}");
+    if (!t->nmembers) error("struct must have at least one member");
+    layout_record(t, is_union);
+    return t;
+}
 static Type *parse_specs(void) {
     Type *t;
     if (take("int")) t = &int_type;
@@ -427,6 +527,8 @@ static Type *parse_specs(void) {
         else t = &uint_type;
         take("int");
     } else if (take("enum")) t = enum_specifier();
+    else if (take("struct")) t = struct_specifier(0);
+    else if (take("union")) t = struct_specifier(1);
     else if ((t = alias_type(current()->text))) ++pos;
     else { error("expected 'int', 'char', 'void', or a typedef name"); return NULL; }
     return t;
@@ -450,16 +552,42 @@ static int decimal(void) {
     ++pos;
     return (int)n;
 }
-static Type *array_suffix(Type *t, int parameter) {
-    if (!take("[")) return t;
-    if (!t->size) error("array element type must be complete");
-    int n = -1;
-    if (strcmp(current()->text, "]")) n = decimal();
-    expect("]");
-    if (parameter) return pointer(t);
-    if (n == -1) return derived(TY_ARRAY, t, 0);
-    if (n <= 0 || n > 4064 / t->size) error("array size must fit the 4080-byte frame limit");
-    return derived(TY_ARRAY, t, n * t->size);
+/* Array declarator suffixes: one or more '[n]' brackets. Dimensions nest
+   so that the first bracket is the outermost array (C row-major order).
+   A missing dimension is allowed only for the outermost bracket, giving
+   an incomplete array completed by a string initializer. Parameters decay
+   to a pointer to the element type. Globals skip the local frame limit. */
+static Type *array_suffix(Type *t, int parameter, int global) {
+    int dims[16], ndims = 0;
+    while (take("[")) {
+        if (!t->size) error("array element type must be complete");
+        int n = -1;
+        if (strcmp(current()->text, "]")) n = decimal();
+        expect("]");
+        if (ndims == 16) error("too many array dimensions");
+        dims[ndims++] = n;
+    }
+    Type *result = t;
+    if (ndims) {
+        if (ndims > 1)
+            for (int i = 1; i < ndims; ++i)
+                if (dims[i] == -1) error("inner array dimensions require an explicit size");
+        for (int i = ndims - 1; i >= 0; --i) {
+            int n = dims[i];
+            if (n == -1) {
+                result = derived(TY_ARRAY, result, 0);
+                continue;
+            }
+            if (n <= 0 || (unsigned long)n * (unsigned long)result->size > 0x7FFFFFFFu)
+                error("array size must fit the 4080-byte frame limit");
+            if (!global && (unsigned long)n * (unsigned long)result->size > 4064u)
+                error("array size must fit the 4080-byte frame limit");
+            result = derived(TY_ARRAY, result, n * result->size);
+        }
+    }
+    /* Parameters decay exactly one array level to the element type. */
+    if (parameter && result->kind == TY_ARRAY) return pointer(result->base);
+    return result;
 }
 /* Declarator: '*'* [name] ('[' ... ']')? Objects require a name; parameter
    and abstract names may be omitted. */
@@ -471,7 +599,7 @@ static Type *parse_declarator(Type *base, char **name_out, int parameter) {
     char *s = NULL;
     if (identifier(current()->text)) s = tokens[pos++].text;
     *name_out = s;
-    return array_suffix(base, parameter);
+    return array_suffix(base, parameter, parameter);
 }
 /* Abstract declarator for casts: specifiers and '*' only. */
 static Type *parse_abstract(void) {
@@ -565,6 +693,8 @@ static Expr value(Expr e) {
     if (e.type->kind == TY_VOID) error("void expression has no value");
     if (e.type->kind == TY_ARRAY) {
         e.type = pointer(e.type->base);
+    } else if (e.type->kind == TY_STRUCT || e.type->kind == TY_UNION) {
+        /* Aggregates decay to their address; no register load. */
     } else if (e.lvalue) {
         if (e.local >= 0 && !locals[e.local].initialized)
             error("unknown local value in self-initializer");
@@ -611,6 +741,12 @@ static Expr convert(Expr e, Type *to) {
             error("incompatible pointer conversion");
         return (Expr){to, 0, -1, e.zero};
     }
+    if (to->kind == TY_STRUCT || to->kind == TY_UNION) {
+        if (!same_type(e.type, to)) error("incompatible aggregate assignment");
+        return (Expr){to, 0, -1, 0};
+    }
+    if (e.type->kind == TY_STRUCT || e.type->kind == TY_UNION)
+        error("cannot convert aggregate to a scalar");
     if (to->kind == TY_BOOL) {
         if (!integer(e.type) && e.type->kind != TY_PTR)
             error("cannot convert to _Bool");
@@ -626,7 +762,28 @@ static Expr convert(Expr e, Type *to) {
        the upper half, and char/bool bytes are already 0-extended. */
     return (Expr){to, 0, -1, e.zero};
 }
+/* Copy an aggregate byte by byte from the address in x0 to the address
+   in the given register (x9 at assignment sites). Uses only register
+   offset addressing and the allowed mnemonics. */
+static void copy_object(Type *t, const char *dest, const char *src) {
+    int size = t->size;
+    if (!size) return;
+    size_t id = next_label++;
+    emit("    sub x11, x11, x11\n");
+    emit(".Lcopy%zu:\n", id);
+    emit("    ldrb w10, [%s, x11]\n", src);
+    emit("    strb w10, [%s, x11]\n", dest);
+    emit("    add x11, x11, #1\n");
+    emit("    sub x10, x11, #%d\n", size);
+    emit("    cbz x10, .Lcopy_end%zu\n", id);
+    emit("    cbz xzr, .Lcopy%zu\n", id);
+    emit(".Lcopy_end%zu:\n", id);
+}
 static void store_value(Type *t, const char *address) {
+    if (t->kind == TY_STRUCT || t->kind == TY_UNION) {
+        copy_object(t, address, "x0");
+        return;
+    }
     emit("    %s %s0, [%s]\n",
          t->kind == TY_CHAR || t->kind == TY_BOOL ? "strb" : "str",
          wide(t) ? "x" : "w", address);
@@ -695,6 +852,16 @@ static Expr string_literal(void) {
     return (Expr){derived(TY_ARRAY, &char_type, (int)str.length + 1), 1, -1, 0};
 }
 static Expr primary(void) {
+    if (!strcmp(current()->text, "sizeof")) {
+        ++pos;
+        expect("(");
+        if (!type_start()) error("sizeof requires a type in parentheses");
+        Type *t = parse_abstract();
+        expect(")");
+        /* ldr w0 zero-extends into x0, matching size_t semantics. */
+        literal((uint32_t)t->size);
+        return (Expr){&ulong_type, 0, -1, t->size == 0};
+    }
     if (take("(")) {
         if (type_start()) {
             Type *to = parse_abstract();
@@ -812,16 +979,38 @@ static Expr binary_add(Expr left, Expr right, int subtract) {
 }
 static Expr postfix(void) {
     Expr e = primary();
-    while (take("[")) {
-        e = value(e);
-        emit("    sub sp, sp, #16\n    str x0, [sp]\n");
-        Expr index = value(expression());
-        expect("]");
-        emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
-        if (!(e.type->kind == TY_PTR || index.type->kind == TY_PTR))
-            error("indexing requires a pointer or array");
-        e = binary_add(e, index, 0);
-        e = (Expr){e.type->base, 1, -1, 0};
+    for (;;) {
+        if (take("[")) {
+            e = value(e);
+            emit("    sub sp, sp, #16\n    str x0, [sp]\n");
+            Expr index = value(expression());
+            expect("]");
+            emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
+            if (!(e.type->kind == TY_PTR || index.type->kind == TY_PTR))
+                error("indexing requires a pointer or array");
+            e = binary_add(e, index, 0);
+            e = (Expr){e.type->base, 1, -1, 0};
+            continue;
+        }
+        int arrow = take("->");
+        if (!arrow && !take(".")) break;
+        if (arrow) {
+            e = value(e);
+            if (e.type->kind != TY_PTR ||
+                (e.type->base->kind != TY_STRUCT && e.type->base->kind != TY_UNION))
+                error("arrow access requires a pointer to a struct or union");
+            e.type = e.type->base;
+        } else {
+            if (!e.lvalue ||
+                (e.type->kind != TY_STRUCT && e.type->kind != TY_UNION))
+                error("member access requires a struct or union object");
+        }
+        char *m = name();
+        Member *mm = find_member(e.type, m);
+        if (!mm) error("unknown member");
+        if (mm->offset > 4095) error("member offset exceeds the 4095 immediate limit");
+        emit("    add x0, x0, #%d\n", mm->offset);
+        e = (Expr){mm->type, 1, -1, 0};
     }
     return e;
 }
@@ -1006,7 +1195,7 @@ static void block(int function_body) {
                 if (nlocals == 256) error("too many active local variables (limit: 256)");
                 char *s = name();
                 int previous = find_local(s);
-                type = array_suffix(type, 0);
+                type = array_suffix(type, 0, 0);
                 if (previous >= 0 && (size_t)previous >= scope_base) {
                     if (is_alias && locals[previous].offset == -1 &&
                         same_type(locals[previous].type, type) &&
@@ -1020,6 +1209,8 @@ static void block(int function_body) {
                     locals[nlocals++] = (Local){s, -1, type, 1, 0};
                 } else {
                     if (type->kind == TY_VOID) error("object cannot have void type");
+                    if (type->kind == TY_STRUCT || type->kind == TY_UNION)
+                        if (!type->size) error("object has incomplete type");
                     int initialize = take("=");
                     String bytes = {0};
                     if (initialize && type->kind == TY_ARRAY && type->base->kind == TY_CHAR &&
@@ -1185,6 +1376,8 @@ static void parse(void) {
         if (!is_alias && !strcmp(current()->text, "(")) {
             if (find_global(s) >= 0) error("name already declared as an object or typedef");
             if (result->kind == TY_ARRAY) error("function cannot return an array");
+            if (result->kind == TY_STRUCT || result->kind == TY_UNION)
+                error("aggregate results are not supported yet");
             expect("(");
             char *params[8] = {0};
             Type *param_types[8] = {0};
@@ -1204,8 +1397,9 @@ static void parse(void) {
                         if (params[i] && params[nparams] && !strcmp(params[i], params[nparams]))
                             error("duplicate parameter name");
                     if (param_types[nparams]->kind == TY_VOID) error("parameter cannot have void type");
-                    if (param_types[nparams]->kind == TY_ARRAY)
-                        param_types[nparams] = pointer(param_types[nparams]->base);
+                    if (param_types[nparams]->kind == TY_STRUCT ||
+                        param_types[nparams]->kind == TY_UNION)
+                        error("aggregate parameters are not supported yet");
                     if (params[nparams])
                         locals[nlocals++] = (Local){params[nparams], 0, param_types[nparams], 1, 0};
                     ++nparams;
@@ -1267,7 +1461,7 @@ static void parse(void) {
         }
         /* Object or typedef declaration with comma-separated declarators. */
         for (;;) {
-            Type *type = array_suffix(result, 0);
+            Type *type = array_suffix(result, 0, 1);
             if (is_alias && type->kind == TY_ARRAY && !type->size)
                 error("typedef array requires an explicit size");
             int previous = find_global(s);
@@ -1276,8 +1470,10 @@ static void parse(void) {
                 ((globals[previous].offset == -1) != is_alias ||
                  !same_type(globals[previous].type, type)))
                 error("conflicting global declaration");
-            if (!is_alias && (type->kind == TY_VOID || type->kind == TY_ARRAY))
+            if (!is_alias && type->kind == TY_VOID)
                 error("global object must have scalar type");
+            if (type->kind == TY_ARRAY || type->kind == TY_STRUCT || type->kind == TY_UNION)
+                if (take("=")) error("global aggregate initializers are not supported yet");
             int initialized = 0;
             uint64_t initial = 0;
             if (!is_alias && take("=")) {
@@ -1319,15 +1515,24 @@ static void parse(void) {
         Local *g = &globals[i];
         if (g->offset < 0) continue; /* typedefs and enum constants */
         const char *prefix = macos ? "_" : "";
-        fprintf(program, ".data\n.p2align %d\n.globl %s%s\n",
-                g->type->size == 8 ? 3 : g->type->size == 4 ? 2 : 0, prefix, g->name);
+        int a = alignment(g->type), p2 = 0;
+        while ((1 << p2) < a) ++p2;
+        fprintf(program, ".data\n.p2align %d\n.globl %s%s\n", p2, prefix, g->name);
         if (!macos) fprintf(program, ".type %s, %%object\n.size %s, %d\n", g->name, g->name, g->type->size);
-        fprintf(program, "%s%s:\n    %s %llu\n", prefix, g->name,
-                g->type->kind == TY_PTR || g->type->kind == TY_LONG || g->type->kind == TY_ULONG
-                    ? ".quad"
-                    : g->type->kind == TY_CHAR ? ".byte" : ".word",
-                (unsigned long long)(g->type->kind == TY_CHAR ? global_values[i] & 255
-                                                              : global_values[i]));
+        fprintf(program, "%s%s:\n", prefix, g->name);
+        if (g->type->kind == TY_ARRAY || g->type->kind == TY_STRUCT ||
+            g->type->kind == TY_UNION) {
+            fprintf(program, "    .zero %d\n", g->type->size);
+        } else {
+            fprintf(program, "    %s %llu\n",
+                    g->type->kind == TY_PTR || g->type->kind == TY_LONG ||
+                            g->type->kind == TY_ULONG
+                        ? ".quad"
+                        : g->type->kind == TY_CHAR ? ".byte" : ".word",
+                    (unsigned long long)(g->type->kind == TY_CHAR
+                                             ? global_values[i] & 255
+                                             : global_values[i]));
+        }
     }
     if (nstrings) {
         fprintf(program, macos ? ".section __TEXT,__const\n" : ".section .rodata\n");

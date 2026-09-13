@@ -48,6 +48,22 @@ The first milestone is implemented in [src/4c.c](src/4c.c):
 - [x] Regression coverage: the latest implementation run passed all 45 tests,
   adding enum, _Bool, multi-declarator, long/unsigned, and cast checks with
   native execution and cross-ABI helpers.
+- [x] Global arrays with static zero initialization, including a 50 by 50 int
+  (10,000-byte) array that does not inherit the 4,080-byte local-frame limit.
+- [x] Multidimensional array declarators and typedefs, row-major indexing, and
+  array-parameter adjustment to row pointers with row-scaled pointer arithmetic.
+- [x] Struct/union definitions, tag lookup with block scoping, incomplete tagged
+  types, and pointers to self-referential records.
+- [x] Target-correct aggregate size, alignment, member offsets, and padding,
+  including nested anonymous unions and structs; layout matches system C.
+- [x] Member access with `.` and `->`, preserving lvalues so member addresses
+  can be passed to procedures.
+- [x] sizeof(type), returning size_t without runtime evaluation.
+- [x] Structure assignment, including arrays and unions within a record and
+  exact self-assignment, copied byte by byte.
+- [x] Regression coverage: the latest implementation run passed all 50 tests,
+  adding struct/union layout, member operations, multidimensional arrays,
+  sizeof, and zero-initialized global aggregate checks.
 
 Other existing foundations include int/char/pointer parameters and results,
 recursion, local one-dimensional arrays, strings, pointer indexing, assignment,
@@ -85,20 +101,23 @@ normalization, and integer width/conversion boundaries with small programs.
 
 ### 2. Add aggregate types and storage
 
-- [ ] Global arrays with static zero initialization. Arr_2_Glob is 50 by 50 ints
-  (10,000 bytes); it must not inherit the 4,080-byte local-frame limit.
-- [ ] Multidimensional array declarators and typedefs, row-major indexing, and
+Implemented; see the checked items in Current status above. Aggregate
+arguments/results by value remain outside this milestone as planned.
+
+- [x] Global arrays with static zero initialization. Arr_2_Glob is 50 by 50 ints
+  (10,000 bytes); it does not inherit the 4,080-byte local-frame limit.
+- [x] Multidimensional array declarators and typedefs, row-major indexing, and
   array-parameter adjustment. Arr_2_Dim parameters decay to pointers to rows,
-  not pointers to int. Row pointer arithmetic must scale by 200 bytes.
-- [ ] Struct/union definitions, tag lookup, incomplete tagged types, and pointers
+  not pointers to int. Row pointer arithmetic scales by 200 bytes.
+- [x] Struct/union definitions, tag lookup, incomplete tagged types, and pointers
   to self-referential records.
-- [ ] Target-correct aggregate size, alignment, member offsets, and padding,
+- [x] Target-correct aggregate size, alignment, member offsets, and padding,
   including the nested union and structs in Rec_Type.
-- [ ] Member access with `.` and `->`, preserving lvalues and allowing member
+- [x] Member access with `.` and `->`, preserving lvalues and allowing member
   addresses to be passed to procedures.
-- [ ] sizeof(type), returning the appropriate size type without runtime evaluation,
+- [x] sizeof(type), returning the appropriate size type without runtime evaluation,
   for malloc(sizeof(Rec_Type)).
-- [ ] Structure assignment, including arrays and the union within a record:
+- [x] Structure assignment, including arrays and the union within a record:
   `*Ptr_Val_Par->Ptr_Comp = *Ptr_Glob;`. Handle self-assignment correctly.
 
 Validate layout against system-compiled C, nested member writes, row indexing,

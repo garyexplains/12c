@@ -538,7 +538,6 @@ int main() {
             ("typedef char Text[];int main(){}", "explicit size"),
             ("int *p=1;int main(){}", "initializer must be zero"),
             ("int x=1+2;int main(){}", "expected ';'"),
-            ("int x[2];int main(){}", "scalar type"),
         ]
         for source, message in cases:
             with self.subTest(source=source):
@@ -877,6 +876,225 @@ int main() {
             ("int main(){int *p=(char*)0;return 0;}", "incompatible pointer"),
         ]
         for source, message in cases:
+            with self.subTest(source=source):
+                result, _ = self.compile(source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message.encode(), result.stderr)
+
+    def test_struct_union_both_targets(self):
+        source = """#include <stdio.h>
+            enum E { E0, E1, E2 };
+            struct Node { struct Node *next; enum E e; int n; char name[9]; };
+            union Mixed { int whole; char bytes[4]; };
+            typedef struct Rec { struct Rec *pc; enum E d;
+                union { struct { enum E ec; int ic; char sc[5]; } v1;
+                        struct { char pad[4]; char c2; } v2;
+                        struct { char c1; char c2; } v3; } var; } Rec;
+            Rec rec;
+            struct Node list;
+            int main() {
+                if (sizeof(struct Node) != 32) return 1;
+                if (sizeof(union Mixed) != 4) return 2;
+                if (sizeof(Rec) != 32) return 3;
+                rec.pc = 0;
+                list.next = 0;
+                if (list.next == 0) putchar('A'); else putchar('B');
+                return 0;
+            }
+            """
+        for target in ("linux", "macos"):
+            with self.subTest(target=target):
+                text = self.successful(source, target).read_text()
+                self.assertIn(".zero 32", text)
+                self.assertIn("adrp x0, _rec" if target == "macos"
+                              else "adrp x0, rec", text)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_struct_member_operations(self):
+        self.execute("""#include <stdio.h>
+            enum E { E0, E1, E2 };
+            struct Node { struct Node *next; enum E e; int n; char name[9]; };
+            union Mixed { int whole; char bytes[4]; };
+            typedef struct Rec { struct Rec *pc; enum E d;
+                union { struct { enum E ec; int ic; char sc[5]; } v1;
+                        struct { char pad[4]; char c2; } v2;
+                        struct { char c1; char c2; } v3; } var; } Rec;
+            Rec rec;
+            struct Node list;
+            struct Node *bump(struct Node *p) { p->n = p->n + 1; return p; }
+            int main() {
+                list.next = 0;
+                list.e = E2;
+                list.n = 7;
+                if (list.e != 2) return 1;
+                if (list.next != 0) return 2;
+                struct Node *p = &list;
+                if (p->n != 7) return 3;
+                if (p->e != E2) return 4;
+                p->next = p;
+                if (p->next != p) return 5;
+                if (bump(p)->n != 8) return 6;
+                if (list.n != 8) return 7;
+                list.name[0] = 'A';
+                if (p->name[0] != 65) return 8;
+                union Mixed m;
+                m.whole = 1094861636;
+                if (m.bytes[0] != 68) return 9;
+                if (m.bytes[3] != 65) return 10;
+                Rec r;
+                r.pc = 0;
+                r.d = E1;
+                r.var.v1.ec = 3;
+                r.var.v1.ic = 5;
+                r.var.v1.sc[0] = 'A';
+                if (r.var.v1.sc[0] != 65) return 11;
+                r.var.v2.c2 = 90;
+                if (r.var.v1.ic != 90) return 12;
+                r.var.v3.c1 = 9;
+                if (r.var.v1.ec != 9) return 13;
+                if (r.d != E1) return 14;
+                rec = r;
+                if (rec.var.v1.ic != 90) return 15;
+                if (rec.pc != 0) return 16;
+                rec = rec;
+                if (rec.var.v1.ec != 9) return 17;
+                struct Node copy;
+                copy = list;
+                if (copy.next != p) return 18;
+                if (copy.name[0] != 65) return 19;
+                putchar(65);
+                return 0;
+            }
+            """, b"A")
+        self.execute("""struct Outer { int a; struct { char c; int n; } in; };
+            int set(struct Outer *o, int v) { o->in.n = v; return o->in.n; }
+            int main() {
+                struct Outer o;
+                o.a = 1;
+                o.in.c = 2;
+                o.in.n = 3;
+                if (o.a + o.in.c + o.in.n != 6) return 1;
+                if (set(&o, 9) != 9) return 2;
+                if (o.in.n != 9) return 3;
+                struct Outer *op = &o;
+                if (op->a != 1) return 4;
+                if ((*op).in.n != 9) return 5;
+                if (sizeof(struct Outer) != 12) return 6;
+                typedef struct Outer OuterT;
+                if (sizeof(OuterT) != 12) return 7;
+                return 0;
+            }
+            """)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_multidim_arrays(self):
+        self.execute("""#include <stdio.h>
+            int grid[4][5];
+            typedef int Row5[5];
+            typedef int Grid[4][5];
+            int fill(Grid g, int rows, int cols) {
+                int i = 0;
+                while (i < rows) {
+                    int j = 0;
+                    while (j < cols) {
+                        g[i][j] = i + j;
+                        j = j + 1;
+                    }
+                    i = i + 1;
+                }
+                return 0;
+            }
+            int read(Grid g, int r, int c) { return g[r][c]; }
+            int main() {
+                if (sizeof(Grid) != 80) return 1;
+                if (sizeof(Row5) != 20) return 2;
+                fill(grid, 4, 5);
+                if (grid[2][3] != 5) return 3;
+                if (grid[0][0] != 0) return 4;
+                if (grid[3][4] != 7) return 5;
+                if (read(grid, 1, 2) != 3) return 6;
+                Row5 *rp = grid + 2;
+                if (rp[0][1] != 3) return 7;
+                if (rp[1][0] != 3) return 8;
+                if (rp[-1][3] != 4) return 9;
+                Grid local;
+                int i = 0;
+                while (i < 4) {
+                    int j = 0;
+                    while (j < 5) { local[i][j] = i + j; j = j + 1; }
+                    i = i + 1;
+                }
+                if (local[2][3] != 5) return 10;
+                int sum = 0;
+                i = 0;
+                while (i < 4) {
+                    int j = 0;
+                    while (j < 5) { sum = sum + local[i][j]; j = j + 1; }
+                    i = i + 1;
+                }
+                if (sum != 70) return 11;
+                putchar(67);
+                return 0;
+            }
+            """, b"C")
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_global_aggregates(self):
+        self.execute("""int ones[8];
+            long counters[3];
+            struct Pair { int a; int b; } pair;
+            int main() {
+                int i = 0;
+                while (i < 8) {
+                    if (ones[i] != 0) return 1;
+                    ones[i] = i + 1;
+                    i = i + 1;
+                }
+                if (ones[7] != 8) return 2;
+                i = 0;
+                while (i < 3) {
+                    if (counters[i] != 0L) return 3;
+                    counters[i] = 3000000000L + i;
+                    i = i + 1;
+                }
+                if (counters[2] != 3000000002L) return 4;
+                if (pair.a != 0) return 5;
+                if (pair.b != 0) return 6;
+                pair.a = 40;
+                pair.b = 2;
+                if (pair.a + pair.b != 42) return 7;
+                struct Pair *pp = &pair;
+                if (pp->a != 40) return 8;
+                int arr[1000];
+                arr[999] = 5;
+                if (arr[999] != 5) return 9;
+                return 0;
+            }
+            """)
+
+    def test_invalid_aggregates(self):
+        cases = [
+            ("struct S x;int main(){}", "unknown struct tag"),
+            ("struct S {int a;};struct S {int b;};int main(){}", "duplicate struct tag"),
+            ("struct S {int a;int a;};int main(){}", "duplicate member"),
+            ("struct S {void v;};int main(){}", "member cannot have void type"),
+            ("struct S {struct S s;};int main(){}", "member has incomplete type"),
+            ("struct S {int a[];};int main(){}", "member has incomplete type"),
+            ("struct S {};int main(){}", "at least one member"),
+            ("struct S {int a;} s;int main(){s.x=1;return 0;}", "unknown member"),
+            ("struct S {int a;} s;int main(){s=1;return 0;}", "incompatible aggregate"),
+            ("struct S {int a;} s=5;int main(){}", "global aggregate initializers"),
+            ("int a[2]={1,2};int main(){}", "global aggregate initializers"),
+            ("struct S {int a;};struct S f(void);int main(){}", "aggregate results"),
+            ("struct S {int a;};int f(struct S s);int main(){}", "aggregate parameters"),
+            ("int main(){int *p;return p.a;}", "member access requires"),
+            ("int main(){int **pp;return pp->a;}", "arrow access requires"),
+            ("int main(){int a[2];return a.b;}", "member access requires"),
+            ("int main(){int n;return sizeof(n);}", "sizeof requires"),
+            ("int main(){int a[2][3];a[1]=5;return 0;}", "assignment requires"),
+        ]
+        for case in cases:
+            source, message = case[0], case[1]
             with self.subTest(source=source):
                 result, _ = self.compile(source)
                 self.assertNotEqual(result.returncode, 0)
