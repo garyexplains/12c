@@ -52,7 +52,8 @@ class CompilerTests(unittest.TestCase):
         self.assertTrue(instructions)
         self.assertLessEqual(set(instructions), ALLOWED)
 
-    def execute(self, source, expected_output=b"", expected_status=0, helper=None, helper_c=False):
+    def execute(self, source, expected_output=b"", expected_status=0,
+                helper=None, helper_c=False, expected_stderr=b""):
         asm = self.successful(source)
         binary = self.work / "program"
         cc = shlex.split(os.environ.get("TEST_CC", "cc"))
@@ -65,7 +66,7 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(link.returncode, 0, link.stderr.decode())
         result = run([binary])
         self.assertEqual(result.stdout, expected_output)
-        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.stderr, expected_stderr)
         self.assertEqual(result.returncode, expected_status)
 
     def test_example_both_assembly_targets(self):
@@ -133,8 +134,6 @@ class CompilerTests(unittest.TestCase):
             ("int main(){return 0;} garbage", "expected 'int'"),
             ("int main(){return 0;} int main(){return 0;}", "duplicate main"),
             ("int putchar(int);", "main() definition"),
-            ("#include <stdlib.h>\nint main(){return 0;}", "only #include"),
-            ("#define A 65\nint main(){return 0;}", "only #include"),
             ("/* unfinished", "unterminated comment"),
             ("int main(){return 0;}\x00", "NUL byte"),
             ("int f(int); int main(){return f();}", "wrong number"),
@@ -148,7 +147,6 @@ class CompilerTests(unittest.TestCase):
             ("int f(int a){int a=1;return a;} int main(){}", "duplicate local"),
             ("int f(int a){return a;} int main(){return a;}", "unknown local"),
             ("int f(int,int,int,int,int,int,int,int,int); int main(){}", "at most eight"),
-            ("int main(int a){return a;}", "main parameters"),
             ("int f(); int main(){}", "use (void)"),
             ("int main(){return f(1);} int f(int a){return a;}", "undeclared function"),
         ]
@@ -1280,9 +1278,95 @@ int main() {
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(message.encode(), result.stderr)
 
+    def test_preprocessor_both_targets(self):
+        source = """#include <stdio.h>
+            #include <string.h>
+            #include <stdio.h>
+            #define VERSION "v 4.2"  /* trailing comment */
+            #define TICK() (clock())
+            #define DEPTH (2 * TICK())
+            #include <time.h>
+            int main() {
+                char text[8];
+                strcpy(text, "abc");
+                putchar(text[1]);
+                putchar('0' + (DEPTH > 0L));
+                printf("\\n%s\\n", VERSION);
+                return 0;
+            }
+            """
+        for target in ("linux", "macos"):
+            with self.subTest(target=target):
+                self.successful(source, target)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_variadic_and_library(self):
+        self.execute("""#include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+            #include <time.h>
+            #include <stdbool.h>
+            #include <stdio.h>
+            #define VALUE 50000L
+            #define WHEN() (clock())
+            int main() {
+                int *p = malloc(sizeof(int));
+                *p = 65;
+                if (*p != 65) return 1;
+                free(p);
+                void *vp = 0;
+                if (vp) return 2;
+                vp = malloc(8);
+                if (!vp) return 3;
+                free(vp);
+                long n = strtol("42", 0, 10);
+                if (n != 42L) return 4;
+                n = VALUE;
+                if (n != 50000L) return 5;
+                if (WHEN() < 0L) return 6;
+                char buf[16];
+                strcpy(buf, "hi");
+                if (buf[1] != 'i') return 7;
+                if (strcmp(buf, "hi")) return 7;
+                printf("A=%c B=%d N=%ld\\n", 'A', 7, n);
+                fprintf(stderr, "e=%d\\n", 4);
+                printf("%s done\\n", "ok");
+                return 0;
+            }
+            """, b"A=A B=7 N=50000\nok done\n", 0, expected_stderr=b"e=4\n")
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_main_arguments(self):
+        self.execute("""#include <stdio.h>
+            #include <stdlib.h>
+            int main(int argc, char *argv[]) {
+                if (argc < 0) return 1;
+                if (argv[0]) { }
+                printf("args %d\\n", argc);
+                long n = strtol("77", 0, 10);
+                putchar('0' + (n == 77L));
+                putchar('0' + (argc == 0 || argc == 1));
+                return 0;
+            }
+            """, b"args 1\n11", 0)
+
+    def test_invalid_preprocessor(self):
+        cases = [
+            ("#if 1\nint main(){return 0;}", "unsupported preprocessor"),
+            ("#endif\nint main(){return 0;}", "unsupported preprocessor"),
+            ("#define F(x) (x)\nint main(){return 0;}", "macro parameters are not supported"),
+            ("#define\nint main(){return 0;}", "malformed #define"),
+            ("#include <missing.h>\nint main(){return 0;}", "cannot open"),
+            ("int main(){return 0;} #define A 1", "'#' is only valid"),
+        ]
+        for source, message in cases:
+            with self.subTest(source=source):
+                result, _ = self.compile(source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message.encode(), result.stderr)
+
     def test_invalid_aggregates(self):
         cases = [
-            ("struct S x;int main(){}", "unknown struct tag"),
             ("struct S {int a;};struct S {int b;};int main(){}", "duplicate struct tag"),
             ("struct S {int a;int a;};int main(){}", "duplicate member"),
             ("struct S {void v;};int main(){}", "member cannot have void type"),

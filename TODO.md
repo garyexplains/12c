@@ -80,6 +80,23 @@ The first milestone is implemented in [src/4c.c](src/4c.c):
   adding multiplication/division edges, logical short-circuit side-effect
   checks, bitwise OR, compound assignment/increment targets, and
   for/do/switch control-flow checks.
+- [x] A controlled built-in preprocessor: #include of any shipped header and
+  #define object-like plus zero-argument function-like macros with
+  rescanning, covering Start_Timer(), Stop_Timer(), and Too_Small_Time.
+- [x] Controlled stdbool.h, stdlib.h, string.h, and time.h; stdio.h expanded
+  with printf, fprintf, opaque FILE, and extern stderr using the target ABI.
+- [x] Void pointers with compatible object-pointer conversions for malloc,
+  free, NULL, and %p casts; const-qualified library parameters accepted.
+- [x] main(int argc, char *argv[]) with normal argument access.
+- [x] malloc, free, strtol, strcpy, strcmp, and clock declared and called
+  through libc with correct AArch64 results.
+- [x] External object declarations for stderr with GOT-based addressing on
+  Linux and GOT-page addressing on macOS.
+- [x] Variadic prototypes and calls to printf/fprintf with default argument
+  promotions, validated against the system ABI (unnamed args in w1/x1
+  onward).
+- [x] Regression coverage: the latest implementation run passed all 59 tests,
+  adding preprocessor, variadic/library, and main-argument checks.
 
 Other existing foundations include int/char/pointer parameters and results,
 recursion, local one-dimensional arrays, strings, pointer indexing, assignment,
@@ -159,26 +176,27 @@ limits if synthesized operations make generated functions too large.
 
 ### 4. Supply preprocessing, headers, and the integer library ABI
 
-This work can begin earlier to expose more of the original source to the parser.
+Implemented; see the checked items in Current status above. Library
+implementations come from libc as planned.
 
-- [ ] Choose and document either a limited built-in preprocessor or an explicit
+- [x] Choose and document either a limited built-in preprocessor or an explicit
   system-preprocessor path with controlled target headers. Do not assume host
   system headers are parseable by this compiler or correct for a different target.
-- [ ] Support the source's object-like macros and zero-argument function-like
+- [x] Support the source's object-like macros and zero-argument function-like
   macros, including nested expansion in Start_Timer(), Stop_Timer(), and
   Too_Small_Time. Handle comments on directives and header guards; preserve
   useful source diagnostics or consume preprocessor line markers.
-- [ ] Add controlled stdbool.h, stdlib.h, string.h, and time.h; expand stdio.h.
+- [x] Add controlled stdbool.h, stdlib.h, string.h, and time.h; expand stdio.h.
   Provide NULL, EXIT_FAILURE, CLOCKS_PER_SEC, size_t, clock_t, and the necessary
   declarations using the target's actual ABI.
-- [ ] Support void pointers and compatible object-pointer conversions for malloc,
+- [x] Support void pointers and compatible object-pointer conversions for malloc,
   free, NULL, and the `%p` casts; support const-qualified library parameters.
-- [ ] Support main(int argc, char *argv[]) and normal argument access.
-- [ ] Declare and correctly call malloc, free, strtol, strcpy, strcmp, and clock.
-- [ ] Support external object declarations and target-correct addressing for
+- [x] Support main(int argc, char *argv[]) and normal argument access.
+- [x] Declare and correctly call malloc, free, strtol, strcpy, strcmp, and clock.
+- [x] Support external object declarations and target-correct addressing for
   stderr, with an opaque FILE type. Account for platform header/symbol differences
   rather than assuming stderr is exported identically on Linux and macOS.
-- [ ] Variadic prototypes and calls to printf/fprintf, including default argument
+- [x] Variadic prototypes and calls to printf/fprintf, including default argument
   promotions and platform-specific argument placement. Linux and macOS variadic
   lowering must be validated separately.
 

@@ -80,6 +80,8 @@ static int find_global(const char *s);
 static int find_function(const char *s);
 static int decimal(void);
 static void comparison(Type *t, const char *op);
+static int identifier(const char *s);
+static void fatal(const char *fmt, ...);
 static int find_global(const char *s) {
     for (size_t i = 0; i < nglobals; ++i)
         if (!strcmp(globals[i].name, s)) return (int)i;
@@ -95,6 +97,11 @@ static int tag_depth;
 /* Set while parsing translation-unit declarations; enumerator constants
    defined there use the global namespace instead of a block's locals. */
 static int global_scope;
+/* Token-level macro table: object-like macros and zero-parameter
+   function-like macros, expanded with rescanning after lexing. */
+typedef struct { char *name; Token *body; size_t nbody; int zero_arg; } Macro;
+static Macro macros[128];
+static size_t nmacros;
 /* case-label records for the innermost switch, per nesting level. */
 #define MAX_CASES 64
 typedef struct { size_t label; int value; } CaseLabel;
@@ -126,11 +133,12 @@ static int type_start(void) {
            !strcmp(s, "void") || !strcmp(s, "_Bool") ||
            !strcmp(s, "long") || !strcmp(s, "unsigned") ||
            !strcmp(s, "enum") || !strcmp(s, "struct") ||
-           !strcmp(s, "union") || alias_type(s) != NULL;
+           !strcmp(s, "union") || !strcmp(s, "const") || alias_type(s) != NULL;
 }
 typedef struct {
     char *name;
     int nparams;
+    int variadic;
     int defined;
     Type *result;
     Type *params[8];
@@ -217,25 +225,9 @@ static void lex(const char *path, int depth) {
             p += 2;
             continue;
         }
-        if (*p == '#' && line_start) {
-            ++p;
-            while (*p == ' ' || *p == '\t') ++p;
-            if (strncmp(p, "include", 7))
-                fatal("%s:%d: only #include <stdio.h> is supported", path, line);
-            p += 7;
-            while (*p == ' ' || *p == '\t') ++p;
-            if (strncmp(p, "<stdio.h>", 9))
-                fatal("%s:%d: only #include <stdio.h> is supported", path, line);
-            p += 9;
-            while (*p == ' ' || *p == '\t' || *p == '\r') ++p;
-            if (*p && *p != '\n')
-                fatal("%s:%d: unexpected text after include", path, line);
-            size_t size = strlen(include_dir) + sizeof("/stdio.h");
-            char *header = resize(NULL, size);
-            snprintf(header, size, "%s/stdio.h", include_dir);
-            lex(header, depth + 1);
-            continue;
-        }
+        if (*p == '#' && !line_start)
+            fatal("%s:%d: '#' is only valid at the start of a directive line",
+                  path, line);
         line_start = 0;
         char *start = p;
         if (*p == '"' || *p == '\'') {
@@ -264,6 +256,8 @@ static void lex(const char *path, int depth) {
             p += 2;
         } else if (p[0] == '|' && p[1] == '|') {
             p += 2;
+        } else if (p[0] == '.' && p[1] == '.' && p[2] == '.') {
+            p += 3;
         } else if ((p[0] == '+' && p[1] == '=') ||
                    (p[0] == '-' && p[1] == '=')) {
             p += 2;
@@ -272,7 +266,7 @@ static void lex(const char *path, int depth) {
             p += 2;
         } else if (*p == '.') {
             ++p;
-        } else if (strchr("(){}[];=,+-<>*&/!|:", *p)) {
+        } else if (strchr("(){}[];=,+-<>*&/!|:#", *p)) {
             ++p;
         } else {
             fatal("%s:%d: unsupported character '%c'", path, line, *p);
@@ -283,6 +277,113 @@ static void lex(const char *path, int depth) {
     /* Tokens retain source spans for assembly comments until compilation ends. */
 }
 
+static void splice_tokens(size_t at, size_t consumed, const Token *newtoks, size_t nnew) {
+    size_t tail = ntokens - at - consumed;
+    size_t total = at + nnew + tail;
+    Token *result = resize(NULL, (total ? total : 1) * sizeof(Token));
+    if (at) memcpy(result, tokens, at * sizeof(Token));
+    if (nnew) memcpy(result + at, newtoks, nnew * sizeof(Token));
+    if (tail) memcpy(result + at + nnew, tokens + at + consumed, tail * sizeof(Token));
+    tokens = result;
+    capacity = total ? total : 1;
+    ntokens = total;
+}
+/* Resolve #include directives and #define macros over the token array,
+   then expand macros with rescanning to a fixed point. */
+static void preprocess(void) {
+    for (size_t i = 0; i < ntokens; ) {
+        if (strcmp(tokens[i].text, "#")) { ++i; continue; }
+        int line = tokens[i].line;
+        size_t end = i + 1;
+        while (end < ntokens && tokens[end].line == line) ++end;
+        if (i + 1 >= end) fatal("%s:%d: incomplete preprocessor directive",
+                                tokens[i].file, line);
+        const char *dir = tokens[i + 1].text;
+        if (!strcmp(dir, "include")) {
+            if (i + 4 > end || strcmp(tokens[i + 2].text, "<") ||
+                strcmp(tokens[end - 1].text, ">"))
+                fatal("%s:%d: malformed #include", tokens[i].file, line);
+            size_t cap = 64, len = 0;
+            char *name = resize(NULL, cap);
+            for (size_t j = i + 3; j + 1 < end; ++j) {
+                size_t need = strlen(tokens[j].text);
+                while (len + need + 1 > cap) { cap *= 2; name = resize(name, cap); }
+                memcpy(name + len, tokens[j].text, need);
+                len += need;
+            }
+            name[len] = 0;
+            size_t size = strlen(include_dir) + strlen(name) + 2;
+            char *header = resize(NULL, size);
+            snprintf(header, size, "%s/%s", include_dir, name);
+            free(name);
+            Token *outer = tokens;
+            size_t outer_n = ntokens, outer_cap = capacity, outer_pos = pos;
+            tokens = NULL;
+            ntokens = 0;
+            capacity = 0;
+            lex(header, 1);
+            Token *inner = tokens;
+            size_t inner_n = ntokens;
+            tokens = outer;
+            ntokens = outer_n;
+            capacity = outer_cap;
+            pos = outer_pos;
+            splice_tokens(i, end - i, inner, inner_n);
+            continue;
+        }
+        if (!strcmp(dir, "define")) {
+            if (i + 3 > end) fatal("%s:%d: malformed #define", tokens[i].file, line);
+            const char *name = tokens[i + 2].text;
+            int zero_arg = 0;
+            size_t first = i + 3;
+            if (first < end && !strcmp(tokens[first].text, "(") &&
+                tokens[first].source == tokens[i + 2].source + strlen(name)) {
+                if (first + 1 >= end || strcmp(tokens[first + 1].text, ")"))
+                    fatal("%s:%d: macro parameters are not supported",
+                          tokens[i].file, line);
+                zero_arg = 1;
+                first = first + 2;
+            }
+            if (nmacros == 128) fatal("%s:%d: too many macros", tokens[i].file, line);
+            Macro *m = &macros[nmacros++];
+            m->name = copy(name, strlen(name));
+            m->zero_arg = zero_arg;
+            m->nbody = end - first;
+            m->body = m->nbody ? resize(NULL, m->nbody * sizeof(Token)) : NULL;
+            for (size_t j = 0; j < m->nbody; ++j) m->body[j] = tokens[first + j];
+            splice_tokens(i, end - i, NULL, 0);
+            continue;
+        }
+        fatal("%s:%d: unsupported preprocessor directive", tokens[i].file, line);
+    }
+    for (int depth = 0; depth < 64; ++depth) {
+        int changed = 0;
+        for (size_t i = 0; i < ntokens; ) {
+            if (!identifier(tokens[i].text)) { ++i; continue; }
+            Macro *m = NULL;
+            for (size_t k = 0; k < nmacros; ++k)
+                if (!strcmp(macros[k].name, tokens[i].text)) { m = &macros[k]; break; }
+            if (!m) { ++i; continue; }
+            size_t consumed = 1;
+            if (m->zero_arg) {
+                if (i + 1 >= ntokens || strcmp(tokens[i + 1].text, "(")) { ++i; continue; }
+                int parens = 0;
+                size_t j = i + 1;
+                for (; j < ntokens; ++j) {
+                    if (!strcmp(tokens[j].text, "(")) ++parens;
+                    else if (!strcmp(tokens[j].text, ")")) { if (--parens == 0) break; }
+                }
+                if (j == ntokens) fatal("%s:%d: unterminated macro call",
+                                        tokens[i].file, tokens[i].line);
+                consumed = j + 1 - i;
+            }
+            splice_tokens(i, consumed, m->body, m->nbody);
+            changed = 1;
+        }
+        if (!changed) return;
+    }
+    fatal("%s:%d: macro expansion too deep", tokens[0].file, tokens[0].line);
+}
 static Token *current(void) { return &tokens[pos]; }
 
 static void error(const char *message) {
@@ -508,16 +609,30 @@ static Type *struct_specifier(int is_union) {
     if (!take("{")) {
         if (!tag) error("expected a struct tag or member list");
         int existing = find_tag(tag);
-        if (existing < 0) error("unknown struct tag");
+        if (existing < 0) {
+            /* Forward declaration: register an incomplete tagged type. */
+            if (ntags == 256) error("too many struct tags");
+            tags[ntags++] = (Tag){tag, derived(is_union ? TY_UNION : TY_STRUCT, NULL, 0), tag_depth};
+            existing = (int)ntags - 1;
+        }
         return tags[existing].type;
     }
-    Type *t = derived(is_union ? TY_UNION : TY_STRUCT, NULL, 0);
-    if (tag) {
-        int existing = find_tag(tag);
-        if (existing >= 0 && tags[existing].depth == tag_depth)
+    int existing = tag ? find_tag(tag) : -1;
+    if (existing >= 0 && tags[existing].depth == tag_depth) {
+        Type *old = tags[existing].type;
+        if (old->nmembers || old->kind != (is_union ? TY_UNION : TY_STRUCT))
             error("duplicate struct tag");
-        if (ntags == 256) error("too many struct tags");
-        tags[ntags++] = (Tag){tag, t, tag_depth};
+    }
+    Type *t;
+    if (existing >= 0 && tags[existing].depth == tag_depth) {
+        /* Complete a previously forward-declared tagged type in place. */
+        t = tags[existing].type;
+    } else {
+        t = derived(is_union ? TY_UNION : TY_STRUCT, NULL, 0);
+        if (tag) {
+            if (ntags == 256) error("too many struct tags");
+            tags[ntags++] = (Tag){tag, t, tag_depth};
+        }
     }
     while (strcmp(current()->text, "}")) {
         if (!strcmp(current()->text, "<eof>"))
@@ -541,6 +656,7 @@ static Type *struct_specifier(int is_union) {
 }
 static Type *parse_specs(void) {
     Type *t;
+    while (take("const")) {}
     if (take("int")) t = &int_type;
     else if (take("char")) t = &char_type;
     else if (take("void")) t = &void_type;
@@ -562,7 +678,6 @@ static Type *parse_specs(void) {
 }
 static Type *consume_stars(Type *t) {
     while (take("*")) {
-        if (t->kind == TY_VOID) error("void pointers are not supported yet");
         t = pointer(t);
     }
     return t;
@@ -620,7 +735,6 @@ static Type *array_suffix(Type *t, int parameter, int global) {
    and abstract names may be omitted. */
 static Type *parse_declarator(Type *base, char **name_out, int parameter) {
     while (take("*")) {
-        if (base->kind == TY_VOID) error("void pointers are not supported yet");
         base = pointer(base);
     }
     char *s = NULL;
@@ -632,7 +746,6 @@ static Type *parse_declarator(Type *base, char **name_out, int parameter) {
 static Type *parse_abstract(void) {
     Type *t = parse_specs();
     while (take("*")) {
-        if (t->kind == TY_VOID) error("void pointers are not supported yet");
         t = pointer(t);
     }
     if (identifier(current()->text) || !strcmp(current()->text, "["))
@@ -776,8 +889,11 @@ static Expr convert(Expr e, Type *to) {
     e = value(e);
     if (to->kind == TY_VOID) error("cannot convert to void");
     if (to->kind == TY_PTR) {
-        if (!(same_type(e.type, to) || (integer(e.type) && e.zero)))
-            error("incompatible pointer conversion");
+        int compatible = same_type(e.type, to) || (integer(e.type) && e.zero);
+        if (!compatible && e.type->kind == TY_PTR &&
+            (e.type->base->kind == TY_VOID || to->base->kind == TY_VOID))
+            compatible = 1;
+        if (!compatible) error("incompatible pointer conversion");
         return (Expr){to, 0, -1, e.zero};
     }
     if (to->kind == TY_STRUCT || to->kind == TY_UNION) {
@@ -950,21 +1066,41 @@ static Expr primary(void) {
         if (function < 0) error("call to an undeclared function");
         Function *fn = &functions[function];
         int expected = fn->nparams;
+        /* Variadic calls always stage the full eight-register area. */
+        int stage = fn->variadic ? 8 : expected;
         ++pos; expect("(");
-        if (expected) emit("    sub sp, sp, #%d\n", expected * 16);
+        if (stage) emit("    sub sp, sp, #%d\n", stage * 16);
+        Type *arg_types[8] = {0};
         int count = 0;
         if (!take(")")) {
-            do {
-                if (count == expected) error("wrong number of function arguments");
-                convert(expression(), fn->params[count]);
+            for (;;) {
+                if (count == 8) error("at most eight function arguments");
+                if (count < expected) {
+                    convert(expression(), fn->params[count]);
+                } else {
+                    if (!fn->variadic)
+                        error("wrong number of function arguments");
+                    /* Default argument promotions for variadic slots. */
+                    Expr a = value(expression());
+                    if (a.type->kind == TY_CHAR) narrow_char();
+                    else if (a.type->kind == TY_STRUCT || a.type->kind == TY_UNION)
+                        error("aggregate arguments are not supported yet");
+                    arg_types[count] = promote(a.type);
+                }
                 emit("    str x0, [sp, #%d]\n", count++ * 16);
-            } while (take(","));
+                if (!take(",")) break;
+            }
             expect(")");
         }
-        if (count != expected) error("wrong number of function arguments");
+        if (fn->variadic) {
+            if (count < expected) error("wrong number of function arguments");
+        } else if (count != expected) {
+            error("wrong number of function arguments");
+        }
         for (int i = 0; i < count; ++i)
-            emit("    ldr %s%d, [sp, #%d]\n", wide(fn->params[i]) ? "x" : "w", i, i * 16);
-        if (expected) emit("    add sp, sp, #%d\n", expected * 16);
+            emit("    ldr %s%d, [sp, #%d]\n",
+                 wide(i < expected ? fn->params[i] : arg_types[i]) ? "x" : "w", i, i * 16);
+        if (stage) emit("    add sp, sp, #%d\n", stage * 16);
         emit("    bl %s%s\n", macos ? "_" : "", s);
         if (fn->result->kind == TY_CHAR) narrow_char();
         else if (fn->result->kind == TY_BOOL) normalize_bool(&int_type);
@@ -973,10 +1109,17 @@ static Expr primary(void) {
     if (local < 0) {
         if (global < 0) error("unknown local or global variable");
         ++pos;
-        if (macos)
+        if (globals[global].offset == -3) {
+            /* External objects resolve through the global offset table. */
+            if (macos)
+                emit("    adrp x0, _%s@GOTPAGE\n    ldr x0, [x0, _%s@GOTPAGEOFF]\n", s, s);
+            else
+                emit("    adrp x0, :got:%s\n    ldr x0, [x0, :got_lo12:%s]\n", s, s);
+        } else if (macos) {
             emit("    adrp x0, _%s@PAGE\n    add x0, x0, _%s@PAGEOFF\n", s, s);
-        else
+        } else {
             emit("    adrp x0, %s\n    add x0, x0, :lo12:%s\n", s, s);
+        }
         return (Expr){globals[global].type, 1, -1, 0};
     }
     ++pos;
@@ -1747,6 +1890,7 @@ static void parse(void) {
     while (strcmp(current()->text, "<eof>")) {
         size_t start = pos;
         int is_alias = take("typedef");
+        int is_extern = take("extern");
         Type *base = parse_specs();
         Type *result = consume_stars(base);
         if (!strcmp(current()->text, ";")) {
@@ -1763,7 +1907,7 @@ static void parse(void) {
             expect("(");
             char *params[8] = {0};
             Type *param_types[8] = {0};
-            int nparams = 0, empty = 0;
+            int nparams = 0, empty = 0, variadic = 0;
             if (take(")")) {
                 empty = 1;
             } else if ((alias_type(current()->text) == &void_type || !strcmp(current()->text, "void")) &&
@@ -1771,8 +1915,15 @@ static void parse(void) {
                 ++pos;
                 expect(")");
             } else {
-                do {
+                for (;;) {
                     if (nparams == 8) error("at most eight scalar parameters are supported");
+                    if (!strcmp(current()->text, "...")) {
+                        if (!nparams)
+                            error("variadic functions require at least one fixed parameter");
+                        variadic = 1;
+                        ++pos;
+                        break;
+                    }
                     Type *param_base = parse_specs();
                     param_types[nparams] = parse_declarator(param_base, &params[nparams], 1);
                     for (int i = 0; i < nparams; ++i)
@@ -1785,23 +1936,24 @@ static void parse(void) {
                     if (params[nparams])
                         locals[nlocals++] = (Local){params[nparams], 0, param_types[nparams], 1, 0};
                     ++nparams;
-                } while (take(","));
+                    if (!take(",")) break;
+                }
                 expect(")");
             }
             nlocals = 0; /* End the prototype parameter scope. */
             int definition = !strcmp(current()->text, "{");
             if (empty && !definition)
                 error("use (void) for a zero-parameter prototype");
-            if (!strcmp(s, "main") && nparams)
-                error("main parameters are not supported yet");
             if (!strcmp(s, "main") && result->kind != TY_INT) error("main must return int");
             int index = find_function(s);
             if (index < 0) {
                 if (nfunctions == 256) error("too many function declarations");
                 index = (int)nfunctions++;
-                functions[index] = (Function){.name=s, .nparams=nparams, .result=result};
+                functions[index] = (Function){.name=s, .nparams=nparams, .variadic=variadic, .result=result};
                 for (int i = 0; i < nparams; ++i) functions[index].params[i] = param_types[i];
-            } else if (functions[index].nparams != nparams || !same_type(functions[index].result, result)) {
+            } else if (functions[index].nparams != nparams ||
+                       functions[index].variadic != variadic ||
+                       !same_type(functions[index].result, result)) {
                 error("conflicting function declaration");
             }
             for (int i = 0; i < nparams; ++i)
@@ -1854,8 +2006,12 @@ static void parse(void) {
                 error("conflicting global declaration");
             if (!is_alias && type->kind == TY_VOID)
                 error("global object must have scalar type");
-            if (type->kind == TY_ARRAY || type->kind == TY_STRUCT || type->kind == TY_UNION)
+            if (is_extern) {
+                if (take("=")) error("extern declarations cannot have an initializer");
+            } else if (type->kind == TY_ARRAY || type->kind == TY_STRUCT ||
+                       type->kind == TY_UNION) {
                 if (take("=")) error("global aggregate initializers are not supported yet");
+            }
             int initialized = 0;
             uint64_t initial = 0;
             if (!is_alias && take("=")) {
@@ -1879,7 +2035,7 @@ static void parse(void) {
             if (previous < 0) {
                 if (nglobals == 256) error("too many global declarations");
                 previous = (int)nglobals++;
-                globals[previous] = (Local){s, is_alias ? -1 : 0, type, 0, 0};
+                globals[previous] = (Local){s, is_alias ? -1 : (is_extern ? -3 : 0), type, 0, 0};
             }
             if (initialized) {
                 if (globals[previous].initialized) error("duplicate global definition");
@@ -1957,6 +2113,7 @@ int main(int argc, char **argv) {
     }
     if (!input) fatal("no input file (use --help for usage)");
     lex(input, 0);
+    preprocess();
     program = tmpfile();
     if (!program) fatal("cannot create program buffer: %s", strerror(errno));
     parse();

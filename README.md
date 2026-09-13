@@ -180,18 +180,39 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   Void functions support bare `return;` and fallthrough; their calls can be
   expression statements, but cannot be used where a value is required.
   Falling off the end of `main` returns zero.
-- Line comments, block comments, and `#include <stdio.h>`.
+- Line comments, block comments, and a controlled built-in preprocessor:
 
-Our header currently declares only `int putchar(int c);`; libc supplies its
-implementation. The compiler reads this header itself and does not load host
-system headers. Repeated includes work because matching prototypes may repeat.
-General preprocessing, macros, other includes, and trailing comments on include
-directives are not supported yet.
+- Line comments, block comments, and a controlled built-in preprocessor:
+  `#include <name.h>` resolves headers from `-I`/the built-in include
+  directory, and `#define` supports object-like macros and zero-parameter
+  function-like macros with rescanning, so nested uses such as
+  `#define Too_Small_Time (2 * CLOCKS_PER_SEC)` expand fully. Parameterized
+  macros, conditionals (`#if`/`#ifdef`), and line markers are rejected;
+  `#` is only valid at the start of a directive line. Trailing comments on
+  directive lines are allowed.
+
+Controlled headers shipped by the compiler (never host system headers)
+declare the interfaces libc provides: `stdio.h` (`putchar`, variadic
+`printf`/`fprintf`, opaque `FILE`, `extern FILE *stderr`), `stdbool.h`
+(`bool`, `true`, `false`), `stdlib.h` (`size_t`, `malloc`, `free`,
+`strtol`, `EXIT_FAILURE`), `string.h` (`strcpy`, `strcmp`), and `time.h`
+(`clock_t`, `CLOCKS_PER_SEC`, `clock`). External objects resolve through
+the global offset table so declarations such as `stderr` interoperate with
+the platform libc on both targets.
+
+Variadic prototypes use `...` after one or more fixed parameters. Calls
+stage all arguments in order and pass unnamed arguments in the following
+registers (`w1`/`x1` onward after the fixed slots), matching the system
+ABI for integer, character, and pointer arguments.
+
+`main` may be defined as `main(int argc, char *argv[])`, with argv decaying
+to `char **`.
 
 Bitwise AND, XOR, shifts, compound assignments beyond `+=`/`-=`, postfix
 `++`/`--`, `continue`, `goto`, and 64-bit division remain future work.
-`const`, `void` objects/pointers, and parenthesized declarators are not
-supported yet.
+`const` is accepted and ignored in declaration specifiers; `void` objects
+are unsupported, but `void` pointers convert freely with other object
+pointers as C allows. Parenthesized declarators are not supported yet.
 Neither are pointer ordering,
 pointer-to-pointer subtraction, or general computed null pointer constants.
 Scalar self-initializer reads, enumerator arithmetic in initializers,
