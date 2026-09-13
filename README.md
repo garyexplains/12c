@@ -63,20 +63,33 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
 ### Currently supported language
 
 - One `int main()` or `int main(void)` definition, without parameters.
-- Types: 32-bit `int`, 8-bit `char`, and 64-bit pointers, including pointers to
-  pointers. Plain `char` is unsigned on AArch64 Linux and signed on macOS,
-  following each target's default ABI. Character expressions promote to `int`.
+- Types: 32-bit `int` and `unsigned`, 64-bit `long` and `unsigned long`, 8-bit
+  `char`, 8-bit `_Bool`, and 64-bit pointers, including pointers to pointers.
+  Plain `char` is unsigned on AArch64 Linux and signed on macOS, following
+  each target's default ABI. Character expressions promote to `int`. `_Bool`
+  storage normalizes every nonzero scalar value to 1 and zero to 0.
+- Enum types: `enum` tags with block scoping and same-scope redefinition
+  checks. Enumerator constants join the ordinary identifier namespace with
+  sequential values or explicit initializers (a decimal literal, another
+  enumerator constant, and an optional sign; no arithmetic yet). Enum
+  variables, parameters, and results behave as `int`. Anonymous enums define
+  constants without a tag; named tags are reusable as `enum Tag`.
 - File-scope and block-scope `typedef` aliases for supported types, including
   fixed-size arrays and `void`. Aliases share the ordinary identifier namespace
-  and obey block shadowing. One declarator per declaration is supported.
-- Global scalar variables (`int`, `char`, and pointers), visible after their
-  declaration, with external linkage and zero initialization by default. Integer
-  and character initializers accept a decimal or character literal with optional
-  unary sign; pointer initializers accept zero. Matching tentative declarations
-  may repeat, with at most one initialized definition. Up to 256 file-scope
-  objects and typedef names combined are supported. Global arrays, `extern`,
-  `static`, address initializers, and general constant expressions remain unsupported.
-- User-defined functions returning `void`, `int`, `char`, or a pointer, with zero to eight
+  and obey block shadowing. Comma-separated declarators share one declaration's
+  specifiers, each with its own `*`/array suffixes; a declarator is visible to
+  later declarators and initializers on the same declaration.
+- Global scalar variables (`int`, `char`, `_Bool`, `unsigned`, `long`,
+  `unsigned long`, and pointers), visible after their declaration, with
+  external linkage and zero initialization by default. Integer and character
+  initializers accept a decimal literal with an optional unary sign and, for
+  the wider types, `L`/`U` suffixes; pointer initializers accept zero. Matching
+  tentative declarations may repeat, with at most one initialized definition.
+  Up to 256 file-scope objects, typedef names, and enumerator constants
+  combined are supported. Global arrays, `extern`, `static`, address
+  initializers, and general constant expressions remain unsupported.
+- User-defined functions returning `void`, `_Bool`, `char`, `int`,
+  `unsigned`, `long`, `unsigned long`, or a pointer, with zero to eight
   parameters of those types,
   including recursion and mutual recursion through forward prototypes. Functions
   must be declared or defined before a call; a definition declares the function
@@ -100,15 +113,25 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   `int a[4] = {1, 2}`, and string initializers such as `char s[] = "hello"` or
   `char s[8] = "hello"`. Omitted initializer elements are zero-filled. Array
   parameters such as `char s[]` are adjusted to pointers.
-- Decimal literals from 0 through 2147483647, local references, parentheses,
-  and unary `+` and `-`.
+- Decimal literals with optional `L`/`l` and `U`/`u` suffixes (combined for
+  `unsigned long`), local references, parentheses,
+  and unary `+` and `-`. Unsuffixed values must fit `int`; `U` values must fit
+  `unsigned int`; suffixed values must fit `long` or `unsigned long`.
+- Casts to the scalar types and to pointers, such as `(long) x`, `(unsigned) n`,
+  `(char) 300`, `(_Bool) p`, or `(int *) 0`. Cast declarators are limited to
+  specifiers and `*` forms; casts to array or `void`, and named or array
+  declarators inside casts, are rejected. Casts to `_Bool` normalize as above;
+  pointer-to-integer casts remain unsupported.
 - Binary `+` and `-`, with left associativity and unary operators taking
-  precedence. Parentheses override precedence.
+  precedence. Parentheses override precedence. Mixed-width operands follow the
+  usual arithmetic conversions across `char`, `_Bool`, `int`, `unsigned`,
+  `long`, and `unsigned long`, so 64-bit math stays at 64 bits.
+- Signed and unsigned integer comparisons `==`, `!=`, `<`, `<=`, `>`, and `>=`,
+  returning exactly `0` or `1` at the common operands' width and signedness.
+  Arithmetic binds more tightly than ordering comparisons,
+  which bind more tightly than equality comparisons; assignment binds last.
 - Assignment to existing locals, including chained assignments (`a = b = 65`)
   and assignments used as expressions (`putchar(a = 65)`).
-- Signed integer comparisons `==`, `!=`, `<`, `<=`, `>`, and `>=`, returning
-  exactly `0` or `1`. Arithmetic binds more tightly than ordering comparisons,
-  which bind more tightly than equality comparisons; assignment binds last.
 - `if`/`else`, including `else if`, and `while` loops. Conditions accept integer
   or pointer expressions: zero/null is false and other values are true. Bodies may be
   single statements or blocks; declarations require a block. An `else` belongs
@@ -133,25 +156,28 @@ directives are not supported yet.
 
 Multiplication, division, other binary operators, compound assignments (`+=`),
 increment/decrement, logical operators (`!`, `&&`, `||`), `break`, `continue`,
-`for`, function pointers, variadic calls, more than eight parameters, other integer
-types, and floating point remain future work. Global arrays, casts, `const`,
+`for`, function pointers, variadic calls, more than eight parameters,
+and floating point remain future work. Global arrays, `const`,
 `void` objects/pointers, `sizeof`, multidimensional array declarations,
 and parenthesized declarators are not supported yet. Neither are pointer ordering,
 pointer-to-pointer subtraction, or general computed null pointer constants.
-Scalar self-initializer reads and the literal expression `-2147483648` are also
+Scalar self-initializer reads, enumerator arithmetic in initializers,
+and the literal expression `-2147483648` are also
 outside this subset. Array lengths must be decimal literals; an omitted length
 is supported only for a string initializer or array parameter.
 Unsupported syntax is rejected rather than passed to the host compiler.
 
 The emitter uses stack slots for locals, 32-bit integer operations, byte loads and
-stores for characters, 64-bit pointer operations, and a separate
-16-byte aligned frame with saved frame/link registers for each function. Each
+stores for characters and `_Bool`, 64-bit pointer and `long` operations, and a
+separate 16-byte aligned frame with saved frame/link registers for each
+function. Each
 function has its own return epilogue and literal pool, with unique labels.
 Arguments are evaluated left-to-right into aligned temporary stack slots, then
-loaded into `w0` through `w7` (or `x0` through `x7` for pointers) before the call. Callees save incoming
+loaded into `w0` through `w7` (or `x0` through `x7` for 64-bit types) before the call. Callees save incoming
 parameters in their frames before executing the body. Results are returned in
-`w0` for integers and `x0` for pointers. Character arguments and results are
-narrowed and extended according to the target. These conventions permit calls
+`w0` for 32-bit integers and `x0` for 64-bit types. Character and `_Bool`
+arguments and results are narrowed and extended according to the target.
+These conventions permit calls
 between generated and system-compiled C.
 Only `main` has C's implicit zero return guarantee; other functions should
 explicitly return a value on every path where their caller uses the result.
@@ -163,9 +189,15 @@ and unsequenced conflicting accesses to a variable have undefined behavior.
 Signed ordering tests operand signs before examining a subtraction result,
 avoiding overflow errors when comparing opposite-sign values. Its `TBZ` branches
 target nearby labels within each comparison; larger statement bodies use `CBZ`.
+The same fixed-size sequence serves 64-bit operands with the `x` registers and
+bit 63, and unsigned operands are pre-adjusted by adding 2^31 or 2^63, which
+maps unsigned order onto signed order. 64-bit integer constants load from two
+32-bit pool words combined by a shifted `ADD` (`lsl #32`), keeping the pool
+word-aligned without wider pool entries.
 Integer constants reside in a literal pool after the function. Strings use
-`ADRP`/`ADD` with Linux or macOS page relocations. Pointer indexing sign-extends
-the integer index and uses shifted `ADD` forms to scale it, retaining the
+`ADRP`/`ADD` with Linux or macOS page relocations. Pointer indexing extends
+the integer index (`sxtw`, or `uxtw` for unsigned types) and uses shifted `ADD`
+forms to scale it, retaining the
 12-mnemonic vocabulary. A conservative code-size
 limit keeps literal loads and return branches in range. Unwind metadata is not
 implemented yet.
@@ -184,6 +216,12 @@ strings, mutable arrays, scaled/negative indexing, pointer aliasing and indirect
 null tests, and mixed pointer/character calls across the native ABI.
 Comparison tests cover all six operators over a matrix
 including `INT_MIN`, `INT_MAX`, negative values, zero, and positive values.
+Declaration tests cover enums (sequential, explicit, negative, and block-scoped
+enumerator values; tag shadowing), `_Bool` normalization from integers,
+characters, and pointers, comma-separated declarators for locals, globals, and
+typedef aliases with per-declarator suffixes, `long`/`unsigned long` boundaries
+and usual arithmetic conversions, unsigned ordering, and casts across the
+scalar types, plus cross-ABI calls passing `long` and `_Bool` values.
 On Linux with `objdump`, it audits
 the actual machine instructions in generated functions, disabling disassembler aliases so
 `ADD x29, sp, #0` is not displayed as `MOV`. Native execution tests are skipped on

@@ -20,7 +20,8 @@ typedef struct {
     const char *source;
 } Token;
 
-typedef enum { TY_INT, TY_CHAR, TY_PTR, TY_ARRAY, TY_VOID } TypeKind;
+typedef enum { TY_BOOL, TY_CHAR, TY_INT, TY_UINT, TY_LONG, TY_ULONG,
+               TY_PTR, TY_ARRAY, TY_VOID } TypeKind;
 typedef struct Type {
     TypeKind kind;
     struct Type *base;
@@ -28,17 +29,21 @@ typedef struct Type {
 } Type;
 static Type void_type = {TY_VOID, NULL, 0};
 static Type int_type = {TY_INT, NULL, 4}, char_type = {TY_CHAR, NULL, 1};
+static Type bool_type = {TY_BOOL, NULL, 1}, uint_type = {TY_UINT, NULL, 4};
+static Type long_type = {TY_LONG, NULL, 8}, ulong_type = {TY_ULONG, NULL, 8};
 typedef struct { Type *type; int lvalue, local, zero; } Expr;
 typedef struct { unsigned char *data; size_t length; } String;
 static String *strings;
 static size_t nstrings;
 static int frame_bytes, max_frame_bytes;
+static int macos;
 
 typedef struct {
     char *name;
-    int offset;
+    int offset; /* >=0 stack offset; -1 typedef; -2 enum constant */
     Type *type;
     int initialized;
+    int value; /* enum constant value when offset == -2 */
 } Local;
 
 static Token *tokens;
@@ -47,14 +52,27 @@ static Local locals[256];
 static size_t nlocals, scope_base, next_label;
 /* An offset of -1 marks a typedef in the ordinary identifier namespace. */
 static Local globals[256];
-static uint32_t global_values[256];
+static uint64_t global_values[256];
 static size_t nglobals;
 static int find_local(const char *s);
+static int find_global(const char *s);
+static int find_function(const char *s);
+static int decimal(void);
 static int find_global(const char *s) {
     for (size_t i = 0; i < nglobals; ++i)
         if (!strcmp(globals[i].name, s)) return (int)i;
     return -1;
 }
+/* Enum tag names live in their own namespace with block scoping: each
+   tag records its nesting depth, and redefinition is an error only in
+   the same scope. Lookup prefers the innermost tag. */
+typedef struct { char *name; Type *type; int depth; } Tag;
+static Tag tags[256];
+static size_t ntags;
+static int tag_depth;
+/* Set while parsing translation-unit declarations; enumerator constants
+   defined there use the global namespace instead of a block's locals. */
+static int global_scope;
 static Type *alias_type(const char *s) {
     int i = find_local(s);
     if (i >= 0) return locals[i].offset == -1 ? locals[i].type : NULL;
@@ -65,7 +83,9 @@ static Token *current(void);
 static int type_start(void) {
     const char *s = current()->text;
     return !strcmp(s, "int") || !strcmp(s, "char") ||
-           !strcmp(s, "void") || alias_type(s) != NULL;
+           !strcmp(s, "void") || !strcmp(s, "_Bool") ||
+           !strcmp(s, "long") || !strcmp(s, "unsigned") ||
+           !strcmp(s, "enum") || alias_type(s) != NULL;
 }
 typedef struct {
     char *name;
@@ -80,7 +100,6 @@ static size_t nfunctions;
 static uint32_t *constants;
 static size_t nconstants;
 static const char *include_dir = DEFAULT_INCLUDE_DIR;
-static int macos;
 static FILE *body, *program;
 static size_t body_chars, current_function;
 
@@ -263,14 +282,156 @@ static int same_type(Type *a, Type *b) {
     return a->kind == b->kind && a->size == b->size &&
            (!a->base || same_type(a->base, b->base));
 }
-static int integer(Type *t) { return t->kind == TY_INT || t->kind == TY_CHAR; }
-static Type *parse_type(void) {
+static int integer(Type *t) {
+    switch (t->kind) {
+    case TY_BOOL: case TY_CHAR: case TY_INT: case TY_UINT:
+    case TY_LONG: case TY_ULONG: return 1;
+    default: return 0;
+    }
+}
+/* Values of wide types live in x registers; narrower ones in w registers. */
+static int wide(Type *t) {
+    return t->kind == TY_PTR || t->kind == TY_LONG || t->kind == TY_ULONG;
+}
+static int unsigned_type(Type *t) {
+    return t->kind == TY_UINT || t->kind == TY_ULONG ||
+           (t->kind == TY_CHAR && !macos);
+}
+/* Usual arithmetic conversions for the supported integer types. */
+static Type *common_integer(Type *a, Type *b) {
+    if (a->kind == TY_ULONG || b->kind == TY_ULONG) return &ulong_type;
+    if (a->kind == TY_LONG || b->kind == TY_LONG) return &long_type;
+    if (a->kind == TY_UINT || b->kind == TY_UINT) return &uint_type;
+    return &int_type;
+}
+static Type *promote(Type *t) {
+    if (t->kind == TY_BOOL || t->kind == TY_CHAR) return &int_type;
+    return t;
+}
+typedef struct { uint64_t value; Type *type; } IntConst;
+static IntConst int_literal(void) {
+    const char *s = current()->text;
+    if (!isdigit((unsigned char)*s) || (s[0] == '0' && isdigit((unsigned char)s[1])))
+        error("expected a decimal integer from 0 to 2147483647");
+    int is_long = 0, is_unsigned = 0;
+    for (const char *p = s; *p; ++p) {
+        if (isdigit((unsigned char)*p)) continue;
+        if (*p == 'L' || *p == 'l') {
+            if (is_long) error("duplicate integer suffix");
+            is_long = 1;
+        } else if (*p == 'U' || *p == 'u') {
+            if (is_unsigned) error("duplicate integer suffix");
+            is_unsigned = 1;
+        } else {
+            error("expected a decimal integer from 0 to 2147483647");
+        }
+    }
+    errno = 0;
+    char *end;
+    unsigned long long n = strtoull(s, &end, 10);
+    if (end != s + strspn(s, "0123456789") || errno)
+        error("expected a decimal integer from 0 to 2147483647");
+    if (!is_long && !is_unsigned && n > INT32_MAX)
+        error("expected a decimal integer from 0 to 2147483647");
+    if (is_long && !is_unsigned && n > INT64_MAX)
+        error("integer literal is too large for long");
+    if (!is_long && is_unsigned && n > UINT32_MAX)
+        error("integer literal is too large for unsigned int");
+    ++pos;
+    Type *t = is_long ? (is_unsigned ? &ulong_type : &long_type)
+                      : (is_unsigned ? &uint_type : &int_type);
+    return (IntConst){n, t};
+}
+static int find_tag(const char *s) {
+    for (size_t i = ntags; i > 0; --i)
+        if (!strcmp(tags[i - 1].name, s)) return (int)i - 1;
+    return -1;
+}
+static int enum_constant(const char *s, int *value) {
+    int i = find_local(s);
+    if (i >= 0) {
+        if (locals[i].offset != -2) return 0;
+        *value = locals[i].value;
+        return 1;
+    }
+    i = find_global(s);
+    if (i >= 0 && globals[i].offset == -2) {
+        *value = globals[i].value;
+        return 1;
+    }
+    return 0;
+}
+static void define_enum_constant(char *s, int value) {
+    if (global_scope) {
+        if (find_global(s) >= 0 || find_function(s) >= 0)
+            error("duplicate enumerator");
+        if (nglobals == 256) error("too many global declarations");
+        globals[nglobals++] = (Local){s, -2, &int_type, 1, value};
+    } else {
+        if (find_local(s) >= 0) error("duplicate enumerator");
+        if (nlocals == 256) error("too many active local variables (limit: 256)");
+        locals[nlocals++] = (Local){s, -2, &int_type, 1, value};
+    }
+}
+static int enum_value(void) {
+    int negative = 0;
+    if (take("-")) negative = 1;
+    else take("+");
+    int value;
+    if (isdigit((unsigned char)*current()->text)) value = decimal();
+    else if (identifier(current()->text) && enum_constant(current()->text, &value))
+        ++pos;
+    else error("expected an enumerator value");
+    return negative ? -value : value;
+}
+/* enum-specifier: 'enum' [tag] ['{' enumerator-list '}']. The type is
+   int-compatible; tags are file-scope and cannot be redefined. */
+static Type *enum_specifier(void) {
+    char *tag = NULL;
+    if (identifier(current()->text)) tag = tokens[pos++].text;
+    if (!take("{")) {
+        if (!tag) error("expected an enumerator list or enum tag");
+        if (find_tag(tag) < 0) error("unknown enum tag");
+        return &int_type;
+    }
+    if (tag) {
+        int existing = find_tag(tag);
+        if (existing >= 0 && tags[existing].depth == tag_depth)
+            error("duplicate enum tag");
+        if (ntags == 256) error("too many enum tags");
+        tags[ntags++] = (Tag){tag, &int_type, tag_depth};
+    }
+    int value = 0;
+    do {
+        if (!identifier(current()->text)) error("expected an enumerator name");
+        char *s = tokens[pos++].text;
+        if (take("=")) value = enum_value();
+        define_enum_constant(s, value);
+        ++value;
+    } while (take(","));
+    expect("}");
+    return &int_type;
+}
+static Type *parse_specs(void) {
     Type *t;
     if (take("int")) t = &int_type;
     else if (take("char")) t = &char_type;
     else if (take("void")) t = &void_type;
+    else if (take("_Bool")) t = &bool_type;
+    else if (take("long")) {
+        if (take("unsigned")) t = &ulong_type;
+        else t = &long_type;
+        take("int");
+    } else if (take("unsigned")) {
+        if (take("long")) t = &ulong_type;
+        else t = &uint_type;
+        take("int");
+    } else if (take("enum")) t = enum_specifier();
     else if ((t = alias_type(current()->text))) ++pos;
     else { error("expected 'int', 'char', 'void', or a typedef name"); return NULL; }
+    return t;
+}
+static Type *consume_stars(Type *t) {
     while (take("*")) {
         if (t->kind == TY_VOID) error("void pointers are not supported yet");
         t = pointer(t);
@@ -299,6 +460,29 @@ static Type *array_suffix(Type *t, int parameter) {
     if (n == -1) return derived(TY_ARRAY, t, 0);
     if (n <= 0 || n > 4064 / t->size) error("array size must fit the 4080-byte frame limit");
     return derived(TY_ARRAY, t, n * t->size);
+}
+/* Declarator: '*'* [name] ('[' ... ']')? Objects require a name; parameter
+   and abstract names may be omitted. */
+static Type *parse_declarator(Type *base, char **name_out, int parameter) {
+    while (take("*")) {
+        if (base->kind == TY_VOID) error("void pointers are not supported yet");
+        base = pointer(base);
+    }
+    char *s = NULL;
+    if (identifier(current()->text)) s = tokens[pos++].text;
+    *name_out = s;
+    return array_suffix(base, parameter);
+}
+/* Abstract declarator for casts: specifiers and '*' only. */
+static Type *parse_abstract(void) {
+    Type *t = parse_specs();
+    while (take("*")) {
+        if (t->kind == TY_VOID) error("void pointers are not supported yet");
+        t = pointer(t);
+    }
+    if (identifier(current()->text) || !strcmp(current()->text, "["))
+        error("declarators in casts are not supported");
+    return t;
 }
 static int allocate(Type *t) {
     int offset = (frame_bytes + 7) & ~7;
@@ -345,13 +529,38 @@ static void source_comment(FILE *out, size_t first, size_t last) {
     fputc('\n', out);
 }
 
-static void literal(uint32_t value) {
+static void pool(uint32_t value) {
     constants = resize(constants, (nconstants + 1) * sizeof(*constants));
     constants[nconstants] = value;
+}
+static void literal(uint32_t value) {
+    pool(value);
     emit("    ldr w0, .LC%zu\n", nconstants++);
+}
+static void literal_reg(const char *reg, uint32_t value) {
+    pool(value);
+    emit("    ldr %s, .LC%zu\n", reg, nconstants++);
+}
+/* Load a 64-bit constant using only 32-bit literal-pool entries and a
+   shifted ADD, keeping the pool word-aligned. */
+static void literal64(uint64_t value) {
+    literal_reg("w0", (uint32_t)(value >> 32));
+    emit("    sub x10, x10, x10\n    add x0, x10, x0, lsl #32\n");
+    literal_reg("w10", (uint32_t)value);
+    emit("    add x0, x0, x10\n");
+}
+/* Same, into an arbitrary x register other than x10 (x10 is scratch). */
+static void literal64_to(const char *xreg, uint64_t value) {
+    char wreg[8];
+    snprintf(wreg, sizeof(wreg), "w%s", xreg + 1);
+    literal_reg(wreg, (uint32_t)(value >> 32));
+    emit("    sub x10, x10, x10\n    add %s, x10, %s, lsl #32\n", xreg, xreg);
+    literal_reg("w10", (uint32_t)value);
+    emit("    add %s, %s, x10\n", xreg, xreg);
 }
 
 static Expr expression(void);
+static Expr unary(void);
 static Expr value(Expr e) {
     if (e.type->kind == TY_VOID) error("void expression has no value");
     if (e.type->kind == TY_ARRAY) {
@@ -359,11 +568,12 @@ static Expr value(Expr e) {
     } else if (e.lvalue) {
         if (e.local >= 0 && !locals[e.local].initialized)
             error("unknown local value in self-initializer");
-        if (e.type->kind == TY_PTR) emit("    ldr x0, [x0]\n");
-        else if (e.type->kind == TY_INT) emit("    ldr w0, [x0]\n");
-        else {
+        if (wide(e.type)) emit("    ldr x0, [x0]\n");
+        else if (e.type->kind == TY_INT || e.type->kind == TY_UINT)
+            emit("    ldr w0, [x0]\n");
+        else { /* TY_CHAR and TY_BOOL load as one byte */
             emit("    ldrb w0, [x0]\n");
-            if (macos) {
+            if (macos && e.type->kind == TY_CHAR) {
                 size_t id = next_label++;
                 emit("    tbz w0, #7, .Lchar%zu\n    sub w0, w0, #256\n.Lchar%zu:\n", id, id);
             }
@@ -380,20 +590,46 @@ static void narrow_char(void) {
         emit("    tbz w0, #7, .Lchar%zu\n    sub w0, w0, #256\n.Lchar%zu:\n", id, id);
     }
 }
+/* Normalize any scalar value in x0/w0 to exactly 0 or 1 for _Bool. */
+static void normalize_bool(Type *from) {
+    size_t id = next_label++;
+    emit(wide(from) ? "    cbz x0, .Lbool%zu\n" : "    cbz w0, .Lbool%zu\n", id);
+    literal_reg("w0", 1);
+    emit("    cbz xzr, .Lbool_end%zu\n.Lbool%zu:\n", id, id);
+    emit("    sub w0, w0, w0\n.Lbool_end%zu:\n", id);
+}
+static void extend_reg(Type *src, const char *wreg, const char *xreg) {
+    emit("    sub x10, x10, x10\n");
+    emit("    add %s, x10, %s, %s\n", xreg, wreg,
+         unsigned_type(src) ? "uxtw" : "sxtw");
+}
 static Expr convert(Expr e, Type *to) {
     e = value(e);
+    if (to->kind == TY_VOID) error("cannot convert to void");
     if (to->kind == TY_PTR) {
         if (!(same_type(e.type, to) || (integer(e.type) && e.zero)))
             error("incompatible pointer conversion");
-    } else {
-        if (!integer(e.type)) error("cannot convert pointer to integer");
-        if (to->kind == TY_CHAR) narrow_char();
+        return (Expr){to, 0, -1, e.zero};
     }
+    if (to->kind == TY_BOOL) {
+        if (!integer(e.type) && e.type->kind != TY_PTR)
+            error("cannot convert to _Bool");
+        if (e.type->kind != TY_BOOL) normalize_bool(e.type);
+        return (Expr){to, 0, -1, e.zero};
+    }
+    if (!integer(e.type)) error("cannot convert pointer to integer");
+    if (to->kind == TY_CHAR) narrow_char();
+    else if (to->kind == TY_LONG || to->kind == TY_ULONG) {
+        if (!wide(e.type)) extend_reg(e.type, "w0", "x0");
+    }
+    /* 32-bit int/uint targets need no emission: w-register forms ignore
+       the upper half, and char/bool bytes are already 0-extended. */
     return (Expr){to, 0, -1, e.zero};
 }
 static void store_value(Type *t, const char *address) {
-    emit("    %s %s0, [%s]\n", t->kind == TY_CHAR ? "strb" : "str",
-         t->kind == TY_PTR ? "x" : "w", address);
+    emit("    %s %s0, [%s]\n",
+         t->kind == TY_CHAR || t->kind == TY_BOOL ? "strb" : "str",
+         wide(t) ? "x" : "w", address);
 }
 static String decode_literal(void) {
     const unsigned char *p = (unsigned char *)current()->text + 1;
@@ -459,7 +695,16 @@ static Expr string_literal(void) {
     return (Expr){derived(TY_ARRAY, &char_type, (int)str.length + 1), 1, -1, 0};
 }
 static Expr primary(void) {
-    if (take("(")) { Expr e = expression(); expect(")"); return e; }
+    if (take("(")) {
+        if (type_start()) {
+            Type *to = parse_abstract();
+            expect(")");
+            return convert(unary(), to);
+        }
+        Expr e = expression();
+        expect(")");
+        return e;
+    }
     if (current()->text[0] == '"') return string_literal();
     if (current()->text[0] == '\'') {
         String str = decode_literal();
@@ -471,8 +716,10 @@ static Expr primary(void) {
         return (Expr){&int_type, 0, -1, n == 0};
     }
     if (isdigit((unsigned char)*current()->text)) {
-        int n = decimal(); literal((uint32_t)n);
-        return (Expr){&int_type, 0, -1, n == 0};
+        IntConst c = int_literal();
+        if (wide(c.type)) literal64(c.value);
+        else literal((uint32_t)c.value);
+        return (Expr){c.type, 0, -1, c.value == 0};
     }
     if (!identifier(current()->text)) error("expected an integer expression or object");
     char *s = current()->text;
@@ -481,6 +728,16 @@ static Expr primary(void) {
     if ((local >= 0 && locals[local].offset == -1) ||
         (local < 0 && global >= 0 && globals[global].offset == -1))
         error("typedef name is not an expression");
+    if (local >= 0 && locals[local].offset == -2) {
+        ++pos;
+        literal((uint32_t)locals[local].value);
+        return (Expr){&int_type, 0, -1, locals[local].value == 0};
+    }
+    if (local < 0 && global >= 0 && globals[global].offset == -2) {
+        ++pos;
+        literal((uint32_t)globals[global].value);
+        return (Expr){&int_type, 0, -1, globals[global].value == 0};
+    }
     if (pos + 1 < ntokens && !strcmp(tokens[pos + 1].text, "(")) {
         if (local >= 0 || global >= 0) error("called name is an object, not a function");
         int function = find_function(s);
@@ -500,10 +757,11 @@ static Expr primary(void) {
         }
         if (count != expected) error("wrong number of function arguments");
         for (int i = 0; i < count; ++i)
-            emit("    ldr %s%d, [sp, #%d]\n", fn->params[i]->kind == TY_PTR ? "x" : "w", i, i * 16);
+            emit("    ldr %s%d, [sp, #%d]\n", wide(fn->params[i]) ? "x" : "w", i, i * 16);
         if (expected) emit("    add sp, sp, #%d\n", expected * 16);
         emit("    bl %s%s\n", macos ? "_" : "", s);
         if (fn->result->kind == TY_CHAR) narrow_char();
+        else if (fn->result->kind == TY_BOOL) normalize_bool(&int_type);
         return (Expr){fn->result, 0, -1, 0};
     }
     if (local < 0) {
@@ -519,9 +777,12 @@ static Expr primary(void) {
     emit("    add x0, x29, #%d\n", locals[local].offset);
     return (Expr){locals[local].type, 1, local, 0};
 }
-/* Scale a signed int index in w0 without new instruction mnemonics. */
-static void scale_index(int size) {
-    emit("    sub x10, x10, x10\n    add x0, x10, w0, sxtw\n");
+/* Scale an integer index into a byte offset without new mnemonics.
+   The index arrives in w0 (narrow) or x0 (long); wide indices are kept. */
+static void scale_index(int size, Type *index) {
+    emit("    sub x10, x10, x10\n");
+    if (wide(index)) emit("    sub x0, x0, xzr\n");
+    else emit("    add x0, x10, w0, %s\n", unsigned_type(index) ? "uxtw" : "sxtw");
     if (size == 1) return;
     for (int bit = 0; size; ++bit, size >>= 1)
         if (size & 1) emit("    add x10, x10, x0, lsl #%d\n", bit);
@@ -530,7 +791,7 @@ static void scale_index(int size) {
 static Expr binary_add(Expr left, Expr right, int subtract) {
     if (left.type->kind == TY_PTR && integer(right.type)) {
         if (!left.type->base->size) error("pointer arithmetic requires a complete object type");
-        scale_index(left.type->base->size);
+        scale_index(left.type->base->size, right.type);
         emit("    %s x0, x9, x0\n", subtract ? "sub" : "add");
         return (Expr){left.type, 0, -1, 0};
     }
@@ -539,8 +800,15 @@ static Expr binary_add(Expr left, Expr right, int subtract) {
         return binary_add(right, left, 0);
     }
     if (!integer(left.type) || !integer(right.type)) error("unsupported pointer arithmetic");
-    emit("    %s w0, w9, w0\n", subtract ? "sub" : "add");
-    return (Expr){&int_type, 0, -1, 0};
+    Type *t = common_integer(left.type, right.type);
+    if (wide(t)) {
+        if (!wide(left.type)) extend_reg(left.type, "w9", "x9");
+        if (!wide(right.type)) extend_reg(right.type, "w0", "x0");
+        emit("    %s x0, x9, x0\n", subtract ? "sub" : "add");
+    } else {
+        emit("    %s w0, w9, w0\n", subtract ? "sub" : "add");
+    }
+    return (Expr){t, 0, -1, 0};
 }
 static Expr postfix(void) {
     Expr e = primary();
@@ -573,8 +841,9 @@ static Expr unary(void) {
     if (plus || take("-")) {
         Expr e = value(unary());
         if (!integer(e.type)) error("unary arithmetic requires an integer");
-        if (!plus) emit("    sub w0, wzr, w0\n");
-        return (Expr){&int_type, 0, -1, e.zero};
+        Type *t = promote(e.type);
+        if (!plus) emit(wide(t) ? "    sub x0, xzr, x0\n" : "    sub w0, wzr, w0\n");
+        return (Expr){t, 0, -1, e.zero};
     }
     return postfix();
 }
@@ -591,13 +860,21 @@ static Expr additive(void) {
     return e;
 }
 
-/* Compare w9 (left) with w0 (right). All short TBZ branches stay within
-   this fixed-size sequence. Opposite signs are resolved before considering
-   subtraction, so signed overflow cannot corrupt the ordering. */
-static void comparison(const char *op) {
+/* Compare the left operand in w9/x9 with the right operand in w0/x0 at
+   the width and signedness of the common type. All short TBZ branches
+   stay within this fixed-size sequence. Opposite signs are resolved
+   before considering subtraction, so signed overflow cannot corrupt the
+   ordering. Unsigned operands are pre-adjusted by adding 2^31 (or 2^63),
+   which maps unsigned order onto signed order. */
+static void comparison(Type *t, const char *op) {
     size_t id = next_label++;
+    int w = !wide(t);
+    int bit = w ? 31 : 63;
+    const char *l = w ? "w9" : "x9";
+    const char *r = w ? "w0" : "x0";
+    const char *s = w ? "w10" : "x10";
     if (!strcmp(op, "==") || !strcmp(op, "!=")) {
-        emit("    sub w10, w9, w0\n    cbz w10, .Lcmp_yes%zu\n", id);
+        emit("    sub %s, %s, %s\n    cbz %s, .Lcmp_yes%zu\n", s, l, r, s, id);
         int equal = !strcmp(op, "==");
         emit("    sub w0, w0, w0\n    add w0, w0, #%d\n", !equal);
         emit("    cbz xzr, .Lcmp_end%zu\n.Lcmp_yes%zu:\n", id, id);
@@ -605,15 +882,24 @@ static void comparison(const char *op) {
     } else {
         int swap = !strcmp(op, ">") || !strcmp(op, "<=");
         int invert = !strcmp(op, ">=") || !strcmp(op, "<=");
-        const char *left = swap ? "w0" : "w9";
-        const char *right = swap ? "w9" : "w0";
-        emit("    sub w10, %s, %s\n", left, right);
-        emit("    tbz %s, #31, .Lcmp_positive%zu\n", left, id);
-        emit("    tbz %s, #31, .Lcmp_yes%zu\n", right, id);
+        const char *left = swap ? r : l;
+        const char *right = swap ? l : r;
+        if (t->kind == TY_UINT || t->kind == TY_ULONG) {
+            if (w) {
+                literal_reg("w10", 0x80000000u);
+                emit("    add %s, %s, w10\n    add %s, %s, w10\n", l, l, r, r);
+            } else {
+                literal64_to("x11", 0x8000000000000000ull);
+                emit("    add %s, %s, x11\n    add %s, %s, x11\n", l, l, r, r);
+            }
+        }
+        emit("    sub %s, %s, %s\n", s, left, right);
+        emit("    tbz %s, #%d, .Lcmp_positive%zu\n", left, bit, id);
+        emit("    tbz %s, #%d, .Lcmp_yes%zu\n", right, bit, id);
         emit("    cbz xzr, .Lcmp_same%zu\n.Lcmp_positive%zu:\n", id, id);
-        emit("    tbz %s, #31, .Lcmp_same%zu\n", right, id);
+        emit("    tbz %s, #%d, .Lcmp_same%zu\n", right, bit, id);
         emit("    cbz xzr, .Lcmp_no%zu\n.Lcmp_same%zu:\n", id, id);
-        emit("    tbz w10, #31, .Lcmp_no%zu\n.Lcmp_yes%zu:\n", id, id);
+        emit("    tbz %s, #%d, .Lcmp_no%zu\n.Lcmp_yes%zu:\n", s, bit, id, id);
         emit("    sub w0, w0, w0\n    add w0, w0, #%d\n", !invert);
         emit("    cbz xzr, .Lcmp_end%zu\n.Lcmp_no%zu:\n", id, id);
         emit("    sub w0, w0, w0\n    add w0, w0, #%d\n", invert);
@@ -622,7 +908,10 @@ static void comparison(const char *op) {
 }
 
 static void typed_comparison(Expr a, Expr b, const char *op) {
-    if (integer(a.type) && integer(b.type)) { comparison(op); return; }
+    if (integer(a.type) && integer(b.type)) {
+        comparison(common_integer(a.type, b.type), op);
+        return;
+    }
     if (strcmp(op, "==") && strcmp(op, "!=")) error("pointer ordering is not supported yet");
     if (!((a.type->kind == TY_PTR && same_type(a.type, b.type)) ||
           (a.type->kind == TY_PTR && integer(b.type) && b.zero) ||
@@ -698,76 +987,84 @@ static void annotate_statement(void) {
 
 static void block(int function_body) {
     expect("{");
-    size_t saved_base = scope_base, saved_locals = nlocals;
+    size_t saved_base = scope_base, saved_locals = nlocals, saved_tags = ntags;
     int saved_bytes = frame_bytes;
     scope_base = function_body ? 0 : nlocals;
+    ++tag_depth;
     while (!take("}")) {
         if (!strcmp(current()->text, "<eof>")) error("expected '}' after block");
         if (type_start() || !strcmp(current()->text, "typedef")) {
             int is_alias = take("typedef");
             annotate_statement();
-            Type *type = parse_type();
-            if (nlocals == 256) error("too many active local variables (limit: 256)");
-            char *s = name();
-            int previous = find_local(s);
-            type = array_suffix(type, 0);
-            if (previous >= 0 && (size_t)previous >= scope_base) {
-                if (is_alias && locals[previous].offset == -1 &&
-                    same_type(locals[previous].type, type)) {
-                    expect(";");
-                    continue;
-                }
-                error("duplicate local variable");
-            }
-            if (is_alias) {
-                if (type->kind == TY_ARRAY && !type->size) error("typedef array requires an explicit size");
+            Type *base = parse_specs();
+            if (!strcmp(current()->text, ";")) {
                 expect(";");
-                locals[nlocals++] = (Local){s, -1, type, 1};
                 continue;
             }
-            if (type->kind == TY_VOID) error("object cannot have void type");
-            int initialize = take("=");
-            String bytes = {0};
-            if (initialize && type->kind == TY_ARRAY && type->base->kind == TY_CHAR &&
-                current()->text[0] == '"') {
-                bytes = string_bytes();
-                if (bytes.length > 4063) error("string initializer is too large");
-                if (!type->size) type->size = (int)bytes.length + 1;
-                if (bytes.length > (size_t)type->size) error("string initializer is too long for array");
-            }
-            if (!type->size) error("array requires an explicit size or a string initializer");
-            size_t local = nlocals++;
-            int offset = allocate(type);
-            locals[local] = (Local){s, offset, type, 0};
-            if (bytes.data) {
-                for (int i = 0; i < type->size; ++i) {
-                    literal(i < (int)bytes.length ? bytes.data[i] : 0);
-                    emit("    add x9, x29, #%d\n", offset + i);
-                    store_value(&char_type, "x9");
+            for (;;) {
+                Type *type = consume_stars(base);
+                if (nlocals == 256) error("too many active local variables (limit: 256)");
+                char *s = name();
+                int previous = find_local(s);
+                type = array_suffix(type, 0);
+                if (previous >= 0 && (size_t)previous >= scope_base) {
+                    if (is_alias && locals[previous].offset == -1 &&
+                        same_type(locals[previous].type, type) &&
+                        !strcmp(current()->text, ";"))
+                        break;
+                    error("duplicate local variable");
                 }
-                free(bytes.data);
-            } else if (initialize && type->kind == TY_ARRAY) {
-                expect("{");
-                int count = type->size / type->base->size, i = 0;
-                do {
-                    if (i == count) error("too many array initializers");
-                    convert(expression(), type->base);
-                    emit("    add x9, x29, #%d\n", offset + i++ * type->base->size);
-                    store_value(type->base, "x9");
-                    if (!take(",")) break;
-                } while (strcmp(current()->text, "}"));
-                expect("}");
-                for (; i < count; ++i) {
-                    emit("    sub x0, x0, x0\n    add x9, x29, #%d\n", offset + i * type->base->size);
-                    store_value(type->base, "x9");
+                if (is_alias) {
+                    if (type->kind == TY_ARRAY && !type->size)
+                        error("typedef array requires an explicit size");
+                    locals[nlocals++] = (Local){s, -1, type, 1, 0};
+                } else {
+                    if (type->kind == TY_VOID) error("object cannot have void type");
+                    int initialize = take("=");
+                    String bytes = {0};
+                    if (initialize && type->kind == TY_ARRAY && type->base->kind == TY_CHAR &&
+                        current()->text[0] == '"') {
+                        bytes = string_bytes();
+                        if (bytes.length > 4063) error("string initializer is too large");
+                        if (!type->size) type->size = (int)bytes.length + 1;
+                        if (bytes.length > (size_t)type->size) error("string initializer is too long for array");
+                    }
+                    if (!type->size) error("array requires an explicit size or a string initializer");
+                    size_t local = nlocals++;
+                    int offset = allocate(type);
+                    locals[local] = (Local){s, offset, type, 0, 0};
+                    if (bytes.data) {
+                        for (int i = 0; i < type->size; ++i) {
+                            literal(i < (int)bytes.length ? bytes.data[i] : 0);
+                            emit("    add x9, x29, #%d\n", offset + i);
+                            store_value(&char_type, "x9");
+                        }
+                        free(bytes.data);
+                    } else if (initialize && type->kind == TY_ARRAY) {
+                        expect("{");
+                        int count = type->size / type->base->size, i = 0;
+                        do {
+                            if (i == count) error("too many array initializers");
+                            convert(expression(), type->base);
+                            emit("    add x9, x29, #%d\n", offset + i++ * type->base->size);
+                            store_value(type->base, "x9");
+                            if (!take(",")) break;
+                        } while (strcmp(current()->text, "}"));
+                        expect("}");
+                        for (; i < count; ++i) {
+                            emit("    sub x0, x0, x0\n    add x9, x29, #%d\n", offset + i * type->base->size);
+                            store_value(type->base, "x9");
+                        }
+                    } else if (initialize) {
+                        convert(expression(), type);
+                        emit("    add x9, x29, #%d\n", offset);
+                        store_value(type, "x9");
+                    }
+                    locals[local].initialized = 1;
                 }
-            } else if (initialize) {
-                convert(expression(), type);
-                emit("    add x9, x29, #%d\n", offset);
-                store_value(type, "x9");
+                if (!take(",")) break;
             }
             expect(";");
-            locals[local].initialized = 1;
         } else {
             statement();
         }
@@ -775,6 +1072,8 @@ static void block(int function_body) {
     nlocals = saved_locals;
     frame_bytes = saved_bytes;
     scope_base = saved_base;
+    ntags = saved_tags;
+    --tag_depth;
 }
 
 static void condition_comment(size_t start) {
@@ -798,7 +1097,7 @@ static void statement(void) {
         size_t id = next_label++;
         condition_comment(start);
         expect("("); Expr cond = value(expression()); expect(")");
-        emit("    cbz %s0, .Lelse%zu\n", cond.type->kind == TY_PTR ? "x" : "w", id);
+        emit("    cbz %s0, .Lelse%zu\n", wide(cond.type) ? "x" : "w", id);
         statement();
         if (take("else")) {
             emit("    cbz xzr, .Lendif%zu\n.Lelse%zu:\n", id, id);
@@ -815,7 +1114,7 @@ static void statement(void) {
         emit(".Lwhile%zu:\n", id);
         condition_comment(start);
         expect("("); Expr cond = value(expression()); expect(")");
-        emit("    cbz %s0, .Lendwhile%zu\n", cond.type->kind == TY_PTR ? "x" : "w", id);
+        emit("    cbz %s0, .Lendwhile%zu\n", wide(cond.type) ? "x" : "w", id);
         statement();
         emit("    cbz xzr, .Lwhile%zu\n.Lendwhile%zu:\n", id, id);
         return;
@@ -852,8 +1151,8 @@ static void emit_function(size_t start, size_t open, size_t first_constant) {
                  "    add x29, sp, #0\n", prefix, fn->name, frame);
     for (int i = 0; i < fn->nparams; ++i)
         fprintf(out, "    %s %s%d, [x29, #%d]\n",
-                fn->params[i]->kind == TY_CHAR ? "strb" : "str",
-                fn->params[i]->kind == TY_PTR ? "x" : "w", i, 16 + i * 8);
+                fn->params[i]->kind == TY_CHAR || fn->params[i]->kind == TY_BOOL ? "strb" : "str",
+                wide(fn->params[i]) ? "x" : "w", i, 16 + i * 8);
     if (fflush(body) || fseek(body, 0, SEEK_SET)) fatal("cannot rewind assembly buffer");
     int ch;
     while ((ch = fgetc(body)) != EOF) fputc(ch, out);
@@ -871,25 +1170,116 @@ static void emit_function(size_t start, size_t open, size_t first_constant) {
 
 static void parse(void) {
     int have_main = 0;
+    global_scope = 1;
     while (strcmp(current()->text, "<eof>")) {
         size_t start = pos;
         int is_alias = take("typedef");
-        Type *result = parse_type();
+        Type *base = parse_specs();
+        Type *result = consume_stars(base);
+        if (!strcmp(current()->text, ";")) {
+            /* Bare specifier: a structurally complete enum tag definition. */
+            expect(";");
+            continue;
+        }
         char *s = name();
-        if (is_alias || strcmp(current()->text, "(")) {
-            result = array_suffix(result, 0);
-            if (is_alias && result->kind == TY_ARRAY && !result->size)
+        if (!is_alias && !strcmp(current()->text, "(")) {
+            if (find_global(s) >= 0) error("name already declared as an object or typedef");
+            if (result->kind == TY_ARRAY) error("function cannot return an array");
+            expect("(");
+            char *params[8] = {0};
+            Type *param_types[8] = {0};
+            int nparams = 0, empty = 0;
+            if (take(")")) {
+                empty = 1;
+            } else if ((alias_type(current()->text) == &void_type || !strcmp(current()->text, "void")) &&
+                       !strcmp(tokens[pos + 1].text, ")")) {
+                ++pos;
+                expect(")");
+            } else {
+                do {
+                    if (nparams == 8) error("at most eight scalar parameters are supported");
+                    Type *param_base = parse_specs();
+                    param_types[nparams] = parse_declarator(param_base, &params[nparams], 1);
+                    for (int i = 0; i < nparams; ++i)
+                        if (params[i] && params[nparams] && !strcmp(params[i], params[nparams]))
+                            error("duplicate parameter name");
+                    if (param_types[nparams]->kind == TY_VOID) error("parameter cannot have void type");
+                    if (param_types[nparams]->kind == TY_ARRAY)
+                        param_types[nparams] = pointer(param_types[nparams]->base);
+                    if (params[nparams])
+                        locals[nlocals++] = (Local){params[nparams], 0, param_types[nparams], 1, 0};
+                    ++nparams;
+                } while (take(","));
+                expect(")");
+            }
+            nlocals = 0; /* End the prototype parameter scope. */
+            int definition = !strcmp(current()->text, "{");
+            if (empty && !definition)
+                error("use (void) for a zero-parameter prototype");
+            if (!strcmp(s, "main") && nparams)
+                error("main parameters are not supported yet");
+            if (!strcmp(s, "main") && result->kind != TY_INT) error("main must return int");
+            int index = find_function(s);
+            if (index < 0) {
+                if (nfunctions == 256) error("too many function declarations");
+                index = (int)nfunctions++;
+                functions[index] = (Function){.name=s, .nparams=nparams, .result=result};
+                for (int i = 0; i < nparams; ++i) functions[index].params[i] = param_types[i];
+            } else if (functions[index].nparams != nparams || !same_type(functions[index].result, result)) {
+                error("conflicting function declaration");
+            }
+            for (int i = 0; i < nparams; ++i)
+                if (!same_type(functions[index].params[i], param_types[i])) error("conflicting function declaration");
+            if (!definition) { expect(";"); continue; }
+            if (functions[index].defined) {
+                if (!strcmp(s, "main")) error("duplicate main definition");
+                error("duplicate function definition");
+            }
+            functions[index].defined = 1; /* Visible during its own body: recursion. */
+            current_function = (size_t)index;
+            nlocals = (size_t)nparams;
+            scope_base = 0;
+            frame_bytes = max_frame_bytes = 16;
+            global_scope = 0;
+            for (int i = 0; i < nparams; ++i) {
+                if (!params[i]) error("function definitions require parameter names");
+                locals[i] = (Local){params[i], allocate(param_types[i]), param_types[i], 1, 0};
+            }
+            body = tmpfile();
+            if (!body) fatal("cannot create assembly buffer: %s", strerror(errno));
+            body_chars = 0;
+            size_t first_constant = nconstants, open = pos;
+            block(1);
+            if (!strcmp(s, "main")) {
+                have_main = 1;
+                fprintf(body, "    // Implicit return 0 when main falls through.\n");
+            } else {
+                fprintf(body, "    // Fallthrough: C does not guarantee a return value here.\n");
+            }
+            emit("    sub w0, w0, w0\n");
+            /* Each function has its own nearby literal pool and return epilogue. */
+            if (body_chars > 262144 || nconstants - first_constant > 16384)
+                fatal("function exceeds code-size limit");
+            emit_function(start, open, first_constant);
+            fclose(body);
+            nlocals = 0;
+            continue;
+        }
+        /* Object or typedef declaration with comma-separated declarators. */
+        for (;;) {
+            Type *type = array_suffix(result, 0);
+            if (is_alias && type->kind == TY_ARRAY && !type->size)
                 error("typedef array requires an explicit size");
             int previous = find_global(s);
             if (find_function(s) >= 0) error("name already declared as a function");
             if (previous >= 0 &&
                 ((globals[previous].offset == -1) != is_alias ||
-                 !same_type(globals[previous].type, result)))
+                 !same_type(globals[previous].type, type)))
                 error("conflicting global declaration");
-            if (!is_alias && (result->kind == TY_VOID || result->kind == TY_ARRAY))
+            if (!is_alias && (type->kind == TY_VOID || type->kind == TY_ARRAY))
                 error("global object must have scalar type");
             int initialized = 0;
-            uint32_t initial = 0;
+            uint64_t initial = 0;
             if (!is_alias && take("=")) {
                 initialized = 1;
                 int negative = take("-");
@@ -900,118 +1290,44 @@ static void parse(void) {
                     initial = str.data[0];
                     if (macos && initial >= 128) initial -= 256;
                     free(str.data);
-                } else initial = (uint32_t)decimal();
-                if (negative) initial = 0u - initial;
-                if (result->kind == TY_PTR && initial != 0)
+                } else {
+                    IntConst c = int_literal();
+                    initial = c.value;
+                }
+                if (negative) initial = 0 - initial;
+                if (type->kind == TY_PTR && initial != 0)
                     error("global pointer initializer must be zero");
             }
-            expect(";");
             if (previous < 0) {
                 if (nglobals == 256) error("too many global declarations");
                 previous = (int)nglobals++;
-                globals[previous] = (Local){s, is_alias ? -1 : 0, result, 0};
+                globals[previous] = (Local){s, is_alias ? -1 : 0, type, 0, 0};
             }
             if (initialized) {
                 if (globals[previous].initialized) error("duplicate global definition");
                 globals[previous].initialized = 1;
                 global_values[previous] = initial;
             }
-            continue;
+            if (!take(",")) break;
+            result = consume_stars(base);
+            s = name();
         }
-        if (find_global(s) >= 0) error("name already declared as an object or typedef");
-        if (result->kind == TY_ARRAY) error("function cannot return an array");
-        expect("(");
-        char *params[8] = {0};
-        Type *param_types[8] = {0};
-        int nparams = 0, empty = 0;
-        if (take(")")) {
-            empty = 1;
-        } else if ((alias_type(current()->text) == &void_type || !strcmp(current()->text, "void")) &&
-                   !strcmp(tokens[pos + 1].text, ")")) {
-            ++pos;
-            expect(")");
-        } else {
-            do {
-                if (nparams == 8) error("at most eight scalar parameters are supported");
-                param_types[nparams] = parse_type();
-                if (identifier(current()->text)) {
-                    params[nparams] = name();
-                    for (int i = 0; i < nparams; ++i)
-                        if (params[i] && !strcmp(params[i], params[nparams]))
-                            error("duplicate parameter name");
-                }
-                param_types[nparams] = array_suffix(param_types[nparams], 1);
-                if (param_types[nparams]->kind == TY_VOID) error("parameter cannot have void type");
-                if (param_types[nparams]->kind == TY_ARRAY)
-                    param_types[nparams] = pointer(param_types[nparams]->base);
-                if (params[nparams])
-                    locals[nlocals++] = (Local){params[nparams], 0, param_types[nparams], 1};
-                ++nparams;
-            } while (take(","));
-            expect(")");
-        }
-        nlocals = 0; /* End the prototype parameter scope. */
-        int definition = !strcmp(current()->text, "{");
-        if (empty && !definition)
-            error("use (void) for a zero-parameter prototype");
-        if (!strcmp(s, "main") && nparams)
-            error("main parameters are not supported yet");
-        if (!strcmp(s, "main") && result->kind != TY_INT) error("main must return int");
-        int index = find_function(s);
-        if (index < 0) {
-            if (nfunctions == 256) error("too many function declarations");
-            index = (int)nfunctions++;
-            functions[index] = (Function){.name=s, .nparams=nparams, .result=result};
-            for (int i = 0; i < nparams; ++i) functions[index].params[i] = param_types[i];
-        } else if (functions[index].nparams != nparams || !same_type(functions[index].result, result)) {
-            error("conflicting function declaration");
-        }
-        for (int i = 0; i < nparams; ++i)
-            if (!same_type(functions[index].params[i], param_types[i])) error("conflicting function declaration");
-        if (!definition) { expect(";"); continue; }
-        if (functions[index].defined) {
-            if (!strcmp(s, "main")) error("duplicate main definition");
-            error("duplicate function definition");
-        }
-        functions[index].defined = 1; /* Visible during its own body: recursion. */
-        current_function = (size_t)index;
-        nlocals = (size_t)nparams;
-        scope_base = 0;
-        frame_bytes = max_frame_bytes = 16;
-        for (int i = 0; i < nparams; ++i) {
-            if (!params[i]) error("function definitions require parameter names");
-            locals[i] = (Local){params[i], allocate(param_types[i]), param_types[i], 1};
-        }
-        body = tmpfile();
-        if (!body) fatal("cannot create assembly buffer: %s", strerror(errno));
-        body_chars = 0;
-        size_t first_constant = nconstants, open = pos;
-        block(1);
-        if (!strcmp(s, "main")) {
-            have_main = 1;
-            fprintf(body, "    // Implicit return 0 when main falls through.\n");
-        } else {
-            fprintf(body, "    // Fallthrough: C does not guarantee a return value here.\n");
-        }
-        emit("    sub w0, w0, w0\n");
-        /* Each function has its own nearby literal pool and return epilogue. */
-        if (body_chars > 262144 || nconstants - first_constant > 16384)
-            fatal("function exceeds code-size limit");
-        emit_function(start, open, first_constant);
-        fclose(body);
-        nlocals = 0;
+        expect(";");
     }
     if (!have_main) error("expected an int main() definition");
     for (size_t i = 0; i < nglobals; ++i) {
         Local *g = &globals[i];
-        if (g->offset == -1) continue;
+        if (g->offset < 0) continue; /* typedefs and enum constants */
         const char *prefix = macos ? "_" : "";
         fprintf(program, ".data\n.p2align %d\n.globl %s%s\n",
                 g->type->size == 8 ? 3 : g->type->size == 4 ? 2 : 0, prefix, g->name);
         if (!macos) fprintf(program, ".type %s, %%object\n.size %s, %d\n", g->name, g->name, g->type->size);
-        fprintf(program, "%s%s:\n    %s %lu\n", prefix, g->name,
-                g->type->kind == TY_PTR ? ".quad" : g->type->kind == TY_CHAR ? ".byte" : ".word",
-                (unsigned long)(g->type->kind == TY_CHAR ? global_values[i] & 255 : global_values[i]));
+        fprintf(program, "%s%s:\n    %s %llu\n", prefix, g->name,
+                g->type->kind == TY_PTR || g->type->kind == TY_LONG || g->type->kind == TY_ULONG
+                    ? ".quad"
+                    : g->type->kind == TY_CHAR ? ".byte" : ".word",
+                (unsigned long long)(g->type->kind == TY_CHAR ? global_values[i] & 255
+                                                              : global_values[i]));
     }
     if (nstrings) {
         fprintf(program, macos ? ".section __TEXT,__const\n" : ".section .rodata\n");

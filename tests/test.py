@@ -578,6 +578,310 @@ int main() {
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message.encode(), result.stderr)
 
+    def test_enums_both_targets(self):
+        source = """#include <stdio.h>
+            enum Color { Red, Green = 5, Blue, Neg = -2 };
+            typedef enum { Tick, Tock } Tick_Tock;
+            enum Color pick(enum Color c);
+            int main() {
+                enum Color d = pick(Green);
+                putchar('A' + d - Blue);
+                Tick_Tock t = Tick;
+                if (t != 0) return 1;
+                putchar('0' + Tock);
+                return 0;
+            }
+            enum Color pick(enum Color c) { if (c == Green) return Blue; return c; }
+            """
+        for target in ("linux", "macos"):
+            with self.subTest(target=target):
+                text = self.successful(source, target).read_text()
+                prefix = "_" if target == "macos" else ""
+                self.assertIn(f"bl {prefix}pick", text)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_enum_programs(self):
+        self.execute("""enum Color { Red, Green = 5, Blue, Neg = -2 };
+            enum Color pick(enum Color c);
+            int main() {
+                if (Red != 0) return 1;
+                if (Green != 5) return 2;
+                if (Blue != 6) return 3;
+                if (Neg != -2) return 4;
+                enum Color d = pick(Green);
+                if (d != Blue) return 5;
+                enum Color e = Blue + 1;
+                if (e != 7) return 6;
+                d = Neg;
+                if (d >= 0) return 7;
+                while (d < Neg) return 8;
+                { enum Color { Red = 9 }; if (Red != 9) return 9; }
+                if (Red != 0) return 10;
+                typedef enum { One = 1 } Tick;
+                Tick t = One;
+                if (t != 1) return 11;
+                if (pick(Blue) != Blue) return 12;
+                return 0;
+            }
+            enum Color pick(enum Color c) { if (c == Green) return Blue; return c; }
+            """)
+        self.execute("""#include <stdio.h>
+            enum Step { S0, S1, S2, S3 };
+            int drive(enum Step s) {
+                int n = 0;
+                while (s != S3) { n = n + 1; s = s + 1; }
+                return n;
+            }
+            int main() { putchar('0' + drive(S1)); return 0; }
+            """, b"2")
+
+    def test_invalid_enums(self):
+        cases = [
+            ("enum E x;int main(){}", "unknown enum tag"),
+            ("enum E {A};enum E {B};int main(){}", "duplicate enum tag"),
+            ("enum {A,A};int main(){}", "duplicate enumerator"),
+            ("int main(){enum {A,A};return 0;}", "duplicate enumerator"),
+            ("int main(){enum {A};enum {A};return 0;}", "duplicate enumerator"),
+            ("enum {A=};int main(){}", "enumerator value"),
+            ("enum {A=-};int main(){}", "enumerator value"),
+            ("enum {5};int main(){}", "enumerator name"),
+            ("enum;int main(){}", "enumerator list"),
+            ("int main(){return E;}", "unknown local"),
+        ]
+        for source, message in cases:
+            with self.subTest(source=source):
+                result, _ = self.compile(source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message.encode(), result.stderr)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_bool_programs(self):
+        self.execute("""int main() {
+                _Bool t = 5;
+                _Bool f = 0;
+                _Bool g = 0;
+                if (t != 1) return 1;
+                if (f != 0) return 2;
+                t = 511;
+                if (t != 1) return 3;
+                t = 0;
+                if (t != 0) return 4;
+                char c = 300;
+                _Bool b = c;
+                if (b != 1) return 5;
+                int n = 0;
+                int *p = 0;
+                _Bool pb = p;
+                if (pb != 0) return 6;
+                p = &n;
+                pb = p;
+                if (pb != 1) return 7;
+                if (t) return 8;
+                if (f) return 9;
+                while (t) { t = 0; }
+                if (t != f) return 10;
+                return 0;
+            }
+            """)
+        self.execute("""_Bool invert(_Bool b) { if (b) return 0; return 1; }
+            int main() { _Bool a = invert(2); _Bool b = invert(0);
+                if (a != 0) return 1; if (b != 1) return 2; return 0; }
+            """)
+        self.execute("""#include <stdio.h>
+            _Bool host(_Bool b, _Bool *out);
+            int generated(_Bool a, _Bool b) { return a + a + b; }
+            int main() { _Bool t = 3; _Bool out = 0;
+                _Bool r = host(t, &out);
+                putchar('0' + r + out);
+                putchar('0' + generated(1, 1));
+                return 0; }
+            """, b"13", helper="""#include <stdbool.h>
+            _Bool host(_Bool b, _Bool *out) {
+                if (b != true) return 0;
+                *out = true;
+                return false;
+            }""", helper_c=True)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_multi_declarators(self):
+        self.execute("""int main() {
+                int a, b = 2, c[3];
+                c[0] = a = b + 1;
+                long x, y = 5, *p, arr[2];
+                arr[0] = 1;
+                arr[1] = 2;
+                p = arr + 1;
+                x = *p + y + c[0];
+                if (a != 3) return 1;
+                if (c[0] != 3) return 2;
+                if (x != 10L) return 3;
+                char n1 = 'A', n2 = 'B', text[2];
+                text[0] = n2;
+                if (n1 != 65) return 4;
+                if (text[0] != 66) return 5;
+                unsigned u1 = 1U, u2 = 2U, u3;
+                u3 = u1 + u2;
+                if (u3 != 3U) return 6;
+                { int b = 9; if (b != 9) return 7; }
+                if (b != 2) return 8;
+                return 0;
+            }
+            """)
+        self.execute("""typedef int Num, *NumRef, Row[4];
+            Num total;
+            NumRef ref;
+            Num set(Num v) { total = v; ref = &total; return *ref; }
+            int main() {
+                Row row;
+                row[2] = 9;
+                if (set(row[2]) != 9) return 1;
+                if (total != 9) return 2;
+                Num a = 1, b = a + 1, c = b + 1;
+                if (a + b + c != 6) return 3;
+                return 0;
+            }
+            """)
+        self.execute("""char g1 = 'A', g2 = 'B';
+            long big1, big2 = 3000000000L;
+            int main() { if (g1 != 65) return 1; if (g2 != 66) return 2;
+                big1 = big2 + big2;
+                if (big1 != 6000000000L) return 3; return 0; }
+            """)
+
+    def test_invalid_multi_declarators(self):
+        cases = [
+            ("int main(){int a, a;return 0;}", "duplicate local"),
+            ("int main(){int a, *a;return 0;}", "duplicate local"),
+            ("int main(){int a, char b;int main(){}", "expected an identifier"),
+            ("int main(){int b=a, a=1;return b;}", "unknown local"),
+            ("typedef int T;char T, U;int main(){}", "conflicting global"),
+            ("int main(){typedef int A, *A;return 0;}", "duplicate local"),
+            ("int main(){int x[2], y[];return 0;}", "explicit size"),
+        ]
+        for source, message in cases:
+            with self.subTest(source=source):
+                result, _ = self.compile(source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message.encode(), result.stderr)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_long_unsigned_programs(self):
+        self.execute("""int main() {
+                long min = -9223372036854775807L - 1L;
+                long max = 9223372036854775807L;
+                if (min >= max) return 1;
+                if (max <= 0L) return 2;
+                if (min >= 0L) return 3;
+                if (min + 1L != -9223372036854775807L) return 4;
+                if (max - 1L != 9223372036854775806L) return 5;
+                if (max + 0L != max) return 6;
+                unsigned long umax = 18446744073709551615UL;
+                if (0UL >= umax) return 7;
+                if (umax + 1UL != 0UL) return 8;
+                if (18446744073709551615UL <= 1UL) return 9;
+                if (18446744073709551614UL >= 18446744073709551615UL) return 10;
+                unsigned u = 2147483648U;
+                if (u <= 1U) return 11;
+                if (u >= 4294967295U) return 12;
+                if (4294967295U <= 2147483648U) return 13;
+                if (2147483648U + 1U != 2147483649U) return 14;
+                long v = 2147483647;
+                v = v + v + 1L;
+                if (v != 4294967295L) return 15;
+                if (v - 4294967296L != -1L) return 16;
+                long w = 5000000000L;
+                if (w - 4294967296L != 705032704L) return 17;
+                if (w + (long)0 != w) return 18;
+                long n = -5L;
+                if (-n != 5L) return 19;
+                if (-w != -5000000000L) return 20;
+                unsigned z = 4294967295U;
+                if (z + 1U != 0U) return 21;
+                if (0L != 0L) return 22;
+                return 0;
+            }
+            """)
+        self.execute("""#include <stdio.h>
+            long twice(long v);
+            int main() {
+                long v = 4000000000L;
+                int ok = 0;
+                if (twice(v) - 8000000000L == 0L) ok = 1;
+                putchar('0' + ok);
+                return 0;
+            }
+            long twice(long v) { return v + v; }
+            """, b"1")
+        self.execute("""long host(long v);
+            unsigned long hostu(unsigned long v);
+            int main() {
+                if (host(3000000000L) != 6000000000L) return 1;
+                if (hostu(18446744073709551615UL) != 18446744073709551614UL) return 2;
+                return 0;
+            }
+            """, helper="""long host(long v) { return v + v; }
+            unsigned long hostu(unsigned long v) { return v - 1UL; }
+            """, helper_c=True)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_cast_programs(self):
+        self.execute("""int main() {
+                unsigned u = 2147483648U;
+                if ((int)u != -2147483647 - 1) return 1;
+                if ((long)u != 2147483648L) return 2;
+                long l = (long)-1;
+                if (l != -1L) return 3;
+                if ((unsigned)l != 4294967295U) return 4;
+                if ((char)300 != 44) return 5;
+                if ((long)(int)4000000000L != 4000000000L - 4294967296L) return 6;
+                if ((long)-5 != -5L) return 7;
+                _Bool b = (_Bool)7;
+                if (b != 1) return 8;
+                if ((_Bool)0 != 0) return 9;
+                int *p = (int *)0;
+                if (p != 0) return 10;
+                int n = 3;
+                p = (int *)&n;
+                if (*p != 3) return 11;
+                if ((_Bool)p != 1) return 12;
+                char c = 'A';
+                if ((long)c != 65L) return 13;
+                if ((int)c + 1 != 66) return 14;
+                long w = (long)5L;
+                if (w != 5L) return 15;
+                if ((unsigned)3000000000L != 3000000000U) return 16;
+                while ((long)0) return 17;
+                if ((long)1) { } else return 18;
+                return 0;
+            }
+            """)
+        self.execute("int main(){long v = (long)2; if (v != 2L) return 1; return 0;}")
+        self.execute("#include <stdio.h>\nint main(){putchar((char)'Q');return 0;}", b"Q")
+        self.execute("int main(){return (int)3L;}", expected_status=3)
+
+    def test_invalid_casts_and_wide_ops(self):
+        cases = [
+            ("int main(){return (int[3])0;}", "casts"),
+            ("int main(){return (void)0;}", "convert to void"),
+            ("int main(){int a;return (int a)0;}", "casts"),
+            ("int main(){char *p;return (long)p;}", "pointer to integer"),
+            ("int main(){int n;int *p=&n;return p;}", "pointer to integer"),
+            ("int main(){long l;return l*2;}", "expected ';'"),
+            ("int main(){long l;return l/2;}", "unsupported character"),
+            ("int main(){unsigned u;return u%3;}", "unsupported character"),
+            ("int main(){long l=9223372036854775808L;return 0;}", "too large for long"),
+            ("int main(){unsigned u=4294967296U;return 0;}", "too large for unsigned"),
+            ("int main(){return 1LL;}", "duplicate integer suffix"),
+            ("int main(){return 1UU;}", "duplicate integer suffix"),
+            ("int main(){return 1x;}", "decimal integer"),
+            ("int main(){int *p=(char*)0;return 0;}", "incompatible pointer"),
+        ]
+        for source, message in cases:
+            with self.subTest(source=source):
+                result, _ = self.compile(source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message.encode(), result.stderr)
+
     @unittest.skipUnless(NATIVE and platform.system() == "Linux" and shutil.which("objdump"),
                          "requires native Linux AArch64 and objdump")
     def test_actual_machine_instruction_whitelist(self):

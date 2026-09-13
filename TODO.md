@@ -30,6 +30,24 @@ The first milestone is implemented in [src/4c.c](src/4c.c):
   including native AArch64 Linux execution, calls across the system C ABI, and an
   actual machine-instruction whitelist audit. macOS has assembly-text checks;
   native assembly/link/execution validation is still outstanding.
+- [x] Enum definitions, enumerator constants, enum variables/parameters, and
+  conversions needed by Enumeration and Ident_1 through Ident_5. Enumerator
+  initializers accept sequential values, a decimal literal, another enumerator
+  constant, and an optional sign; enum tags have block scoping.
+- [x] _Bool storage, integer promotion, and conversion that normalizes any nonzero
+  scalar value to 1, including bool parameters and results across the native ABI.
+- [x] Multiple declarators sharing declaration specifiers, including different
+  pointer/array suffixes per declarator, for locals, globals, and typedefs.
+- [x] Target-correct long and unsigned integer support for long run counts,
+  size_t, and clock_t: 64-bit arithmetic, usual arithmetic conversions,
+  signed/unsigned comparisons at both widths, integer suffixes such as 50000L,
+  and .quad globals.
+- [x] Cast parsing and conversions for `(int) Run_Index` and
+  `(long) CLOCKS_PER_SEC` at scalar types and pointers; void-pointer casts and
+  double casts are still future milestones.
+- [x] Regression coverage: the latest implementation run passed all 45 tests,
+  adding enum, _Bool, multi-declarator, long/unsigned, and cast checks with
+  native execution and cross-ABI helpers.
 
 Other existing foundations include int/char/pointer parameters and results,
 recursion, local one-dimensional arrays, strings, pointer indexing, assignment,
@@ -45,21 +63,21 @@ first diagnostic will expose the language and ABI requirements below.
 
 ### 1. Finish basic declarations and integer types
 
-This is the next recommended implementation step, starting with enums, _Bool,
-and comma-separated declarations.
+Implemented; see the checked items in Current status above. Dhrystone still
+needs the remaining milestones below before it can compile.
 
-- [ ] Enum definitions, enumerator constants, enum variables/parameters, and
+- [x] Enum definitions, enumerator constants, enum variables/parameters, and
   conversions needed by Enumeration and Ident_1 through Ident_5.
-- [ ] _Bool storage, integer promotion, and conversion that normalizes any nonzero
+- [x] _Bool storage, integer promotion, and conversion that normalizes any nonzero
   scalar value to 1. Supply bool/true/false through stdbool.h when preprocessing
   is available.
-- [ ] Multiple declarators sharing declaration specifiers, including different
+- [x] Multiple declarators sharing declaration specifiers, including different
   pointer/array suffixes. Dhrystone uses both `char Ch_1_Glob, Ch_2_Glob;` and
   `typedef struct record { ... } Rec_Type, *Rec_Pointer;`.
-- [ ] Target-correct long and unsigned integer support needed by long run counts,
+- [x] Target-correct long and unsigned integer support needed by long run counts,
   size_t, and clock_t; integer suffixes such as 50000L; arithmetic conversions
   and comparisons at the correct width.
-- [ ] Cast parsing and conversions for `(int) Run_Index`, `(long) CLOCKS_PER_SEC`,
+- [x] Cast parsing and conversions for `(int) Run_Index`, `(long) CLOCKS_PER_SEC`,
   and, in later milestones, void pointers and double.
 
 Validate typedef composition, declaration scope, enum values, boolean
