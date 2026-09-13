@@ -79,6 +79,7 @@ static int find_local(const char *s);
 static int find_global(const char *s);
 static int find_function(const char *s);
 static int decimal(void);
+static void comparison(Type *t, const char *op);
 static int find_global(const char *s) {
     for (size_t i = 0; i < nglobals; ++i)
         if (!strcmp(globals[i].name, s)) return (int)i;
@@ -94,6 +95,24 @@ static int tag_depth;
 /* Set while parsing translation-unit declarations; enumerator constants
    defined there use the global namespace instead of a block's locals. */
 static int global_scope;
+/* case-label records for the innermost switch, per nesting level. */
+#define MAX_CASES 64
+typedef struct { size_t label; int value; } CaseLabel;
+static size_t switch_ids[8];
+static CaseLabel switch_cases[8][MAX_CASES];
+static int switch_case_count[8];
+static int switch_has_default[8];
+static int switch_depth;
+/* break targets: each loop or switch pushes its end label name. */
+static char break_names[32][32];
+static int break_depth;
+static void fatal(const char *fmt, ...);
+static void push_break(const char *kind, size_t id) {
+    if (break_depth == 32) fatal("break nesting is too deep");
+    snprintf(break_names[break_depth], sizeof(break_names[0]), kind, id);
+    ++break_depth;
+}
+static void pop_break(void) { --break_depth; }
 static Type *alias_type(const char *s) {
     int i = find_local(s);
     if (i >= 0) return locals[i].offset == -1 ? locals[i].type : NULL;
@@ -241,11 +260,19 @@ static void lex(const char *path, int depth) {
             p += 2;
         } else if (p[0] == '-' && p[1] == '>') {
             p += 2;
+        } else if (p[0] == '&' && p[1] == '&') {
+            p += 2;
+        } else if (p[0] == '|' && p[1] == '|') {
+            p += 2;
+        } else if ((p[0] == '+' && p[1] == '=') ||
+                   (p[0] == '-' && p[1] == '=')) {
+            p += 2;
+        } else if ((p[0] == '+' && p[1] == '+') ||
+                   (p[0] == '-' && p[1] == '-')) {
+            p += 2;
         } else if (*p == '.') {
             ++p;
-        } else if (strchr("(){}[];=,+-<>*&", *p)) {
-            if ((p[0] == '+' && p[1] == '+') || (p[0] == '-' && p[1] == '-'))
-                fatal("%s:%d: increment and decrement are not supported", path, line);
+        } else if (strchr("(){}[];=,+-<>*&/!|:", *p)) {
             ++p;
         } else {
             fatal("%s:%d: unsupported character '%c'", path, line, *p);
@@ -689,6 +716,18 @@ static void literal64_to(const char *xreg, uint64_t value) {
 
 static Expr expression(void);
 static Expr unary(void);
+/* Load a value from the address held in the given register into w9/x9. */
+static void load_value_reg(Type *t, const char *addr) {
+    if (wide(t)) emit("    ldr x9, [%s]\n", addr);
+    else if (t->kind == TY_INT || t->kind == TY_UINT) emit("    ldr w9, [%s]\n", addr);
+    else {
+        emit("    ldrb w9, [%s]\n", addr);
+        if (macos && t->kind == TY_CHAR) {
+            size_t id = next_label++;
+            emit("    tbz w9, #7, .Lc9%zu\n    sub w9, w9, #256\n.Lc9%zu:\n", id, id);
+        }
+    }
+}
 static Expr value(Expr e) {
     if (e.type->kind == TY_VOID) error("void expression has no value");
     if (e.type->kind == TY_ARRAY) {
@@ -1026,6 +1065,17 @@ static Expr unary(void) {
         if (!e.type->base->size) error("dereference requires a complete object type");
         return (Expr){e.type->base, 1, -1, 0};
     }
+    if (take("!")) {
+        Expr e = value(unary());
+        if (wide(e.type)) {
+            emit("    sub x9, x0, xzr\n    sub x0, x0, x0\n");
+            comparison(&ulong_type, "==");
+        } else {
+            emit("    sub w9, w0, wzr\n    sub w0, w0, w0\n");
+            comparison(&int_type, "==");
+        }
+        return (Expr){&int_type, 0, -1, 0};
+    }
     int plus = take("+");
     if (plus || take("-")) {
         Expr e = value(unary());
@@ -1034,15 +1084,122 @@ static Expr unary(void) {
         if (!plus) emit(wide(t) ? "    sub x0, xzr, x0\n" : "    sub w0, wzr, w0\n");
         return (Expr){t, 0, -1, e.zero};
     }
+    int inc = take("++");
+    if (inc || take("--")) {
+        Expr e = unary();
+        if (!e.lvalue || e.type->kind == TY_ARRAY)
+            error("increment and decrement require an assignable object");
+        emit("    sub sp, sp, #16\n    str x0, [sp]\n");
+        emit("    ldr x9, [sp]\n");
+        load_value_reg(e.type, "x9");
+        literal(1);
+        Expr one = wide(e.type) ? (Expr){&long_type, 0, -1, 0}
+                                : (Expr){&int_type, 0, -1, 0};
+        if (wide(e.type)) extend_reg(&int_type, "w0", "x0");
+        Expr res = binary_add((Expr){e.type, 0, -1, 0}, one, !inc);
+        res = convert(res, e.type);
+        emit("    ldr x11, [sp]\n    add sp, sp, #16\n");
+        store_value(e.type, "x11");
+        return (Expr){e.type, 0, -1, 0};
+    }
     return postfix();
 }
-static Expr additive(void) {
+/* Multiply the left operand (w9/x9) by the right operand (w0/x0) at the
+   common type's width. Two's-complement wrapping makes signed and
+   unsigned multiplication identical modulo the width, so the raw bit
+   patterns are multiplied: each fixed multiplier bit is tested with TBZ
+   and the shifted multiplicand is accumulated into x11 with a shifted
+    ADD. Carries above the width cannot corrupt the low bits, so the
+    result is read back at the width's register form. */
+static void emit_multiply(Type *t) {
+    size_t id = next_label++;
+    int bits = wide(t) ? 64 : 32;
+    const char *r = wide(t) ? "x0" : "w0";
+    emit("    sub x11, x11, x11\n");
+    for (int i = 0; i < bits; ++i) {
+        emit("    tbz %s, #%d, .Lmul%zu_%d\n", r, i, id, i);
+        emit("    add x11, x11, x9, lsl #%d\n", i);
+        emit(".Lmul%zu_%d:\n", id, i);
+    }
+    emit("    sub x0, x11, xzr\n");
+}
+/* Divide the left operand (w9) by the right operand (w0) truncating
+   toward zero, at 32-bit width only; 64-bit division is unsupported.
+   Operands are zero-extended so the restoring loop runs on clean
+   unsigned patterns; signedness is tracked in x13/x14 flags and the
+   quotient is negated once per negative operand. */
+static void emit_divide(Type *t) {
+    size_t id = next_label++;
+    if (wide(t)) fatal("64-bit division is not supported yet");
+    emit("    sub x13, x13, x13\n    add x9, x13, w9, uxtw\n");
+    emit("    sub x13, x13, x13\n    add x0, x13, w0, uxtw\n");
+    if (t->kind == TY_INT) {
+        emit("    sub x13, x13, x13\n");
+        emit("    tbz w9, #31, .Ldsa%zu\n", id);
+        emit("    add x13, x13, #1\n    sub w9, wzr, w9\n");
+        emit(".Ldsa%zu:\n", id);
+        emit("    sub x14, x14, x14\n");
+        emit("    tbz w0, #31, .Ldsb%zu\n", id);
+        emit("    add x14, x14, #1\n    sub w0, wzr, w0\n");
+        emit(".Ldsb%zu:\n", id);
+    }
+    emit("    sub x10, x10, x10\n    sub x11, x11, x11\n");
+    for (int i = 31; i >= 0; --i) {
+        emit("    add x10, x10, x10\n");
+        emit("    tbz w9, #%d, .Ldva%zu_%d\n", i, id, i);
+        emit("    add x10, x10, #1\n");
+        emit(".Ldva%zu_%d:\n", id, i);
+        emit("    sub x12, x10, x0\n");
+        emit("    tbz x12, #63, .Ldvt%zu_%d\n", id, i);
+        emit("    cbz xzr, .Ldvn%zu_%d\n", id, i);
+        emit(".Ldvt%zu_%d:\n    sub x10, x10, x0\n", id, i);
+        if (i < 12) {
+            emit("    add x11, x11, #%d\n", 1 << i);
+        } else {
+            literal_reg("w12", 1u << i);
+            emit("    add x11, x11, w12, uxtw\n");
+        }
+        emit(".Ldvn%zu_%d:\n", id, i);
+    }
+    emit("    sub w0, w11, wzr\n");
+    if (t->kind == TY_INT) {
+        emit("    tbz x13, #0, .Ldvs%zu\n    sub w0, wzr, w0\n.Ldvs%zu:\n", id, id);
+        emit("    tbz x14, #0, .Ldvo%zu\n    sub w0, wzr, w0\n.Ldvo%zu:\n", id, id);
+    }
+}
+/* Multiplication and division bind more tightly than addition. */
+static Expr multiplicative(void) {
     Expr e = unary();
+    for (;;) {
+        int star = take("*");
+        if (!star && !take("/")) break;
+        e = value(e);
+        emit("    sub sp, sp, #16\n    str x0, [sp]\n");
+        Expr right = value(unary());
+        emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
+        if (!integer(e.type) || !integer(right.type))
+            error("multiplication and division require integers");
+        Type *t = common_integer(e.type, right.type);
+        if (star) {
+            if (!wide(t)) {
+                extend_reg(e.type, "w9", "x9");
+                extend_reg(right.type, "w0", "x0");
+            }
+            emit_multiply(t);
+        } else {
+            emit_divide(t);
+        }
+        e = (Expr){t, 0, -1, 0};
+    }
+    return e;
+}
+static Expr additive(void) {
+    Expr e = multiplicative();
     while (!strcmp(current()->text, "+") || !strcmp(current()->text, "-")) {
         int subtract = take("-"); if (!subtract) expect("+");
         e = value(e);
         emit("    sub sp, sp, #16\n    str x0, [sp]\n");
-        Expr right = value(unary());
+        Expr right = value(multiplicative());
         emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
         e = binary_add(e, right, subtract);
     }
@@ -1140,8 +1297,80 @@ static Expr equality(void) {
     }
     return e;
 }
-static Expr expression(void) {
+/* Bitwise OR: result bit i is set when either operand's bit i is set.
+   Starting from the left operand's pattern, each right-operand bit is
+   tested with TBZ; if it is set and the left bit is clear, the result
+   gains that bit through an immediate or literal-pool ADD. */
+static Expr bit_or(void) {
     Expr e = equality();
+    while (take("|")) {
+        size_t id = next_label++;
+        e = value(e);
+        emit("    sub sp, sp, #16\n    str x0, [sp]\n");
+        Expr right = value(equality());
+        emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
+        if (!integer(e.type) || !integer(right.type))
+            error("bitwise or requires integers");
+        Type *t = common_integer(e.type, right.type);
+        int bits = wide(t) ? 64 : 32;
+        const char *a = wide(t) ? "x9" : "w9";
+        const char *b = wide(t) ? "x0" : "w0";
+        if (!wide(t)) {
+            /* Normalize the low 32 bits; upper bits must be zero. */
+            emit("    sub x10, x10, x10\n    add x9, x10, w9, uxtw\n");
+        }
+        for (int i = 0; i < bits; ++i) {
+            emit("    tbz %s, #%d, .Lbor%zu_e%d\n", b, i, id, i);
+            emit("    tbz %s, #%d, .Lbor%zu_%d\n", a, i, id, i);
+            emit("    cbz xzr, .Lbor%zu_e%d\n", id, i);
+            emit(".Lbor%zu_%d:\n", id, i);
+            if (i < 12) emit("    add %s, %s, #%d\n", a, a, 1 << i);
+            else {
+                literal_reg("w10", 1u << i);
+                emit("    add %s, %s, w10\n", a, a);
+            }
+            emit(".Lbor%zu_e%d:\n", id, i);
+        }
+        if (wide(t)) emit("    sub x0, x9, xzr\n");
+        else emit("    sub w0, w9, wzr\n");
+        e = (Expr){t, 0, -1, 0};
+    }
+    return e;
+}
+/* Logical AND yields 1 only when both sides are nonzero; the right side
+   is evaluated only after the left side proved nonzero. */
+static Expr logical_and(void) {
+    Expr e = bit_or();
+    while (take("&&")) {
+        size_t id = next_label++;
+        e = value(e);
+        emit(wide(e.type) ? "    cbz x0, .Land%zu\n" : "    cbz w0, .Land%zu\n", id);
+        Expr right = value(bit_or());
+        normalize_bool(right.type);
+        emit(".Land%zu:\n", id);
+        e = (Expr){&int_type, 0, -1, 0};
+    }
+    return e;
+}
+/* Logical OR yields 1 when either side is nonzero; the right side runs
+   only after the left side proved zero. */
+static Expr logical_or(void) {
+    Expr e = logical_and();
+    while (take("||")) {
+        size_t id = next_label++;
+        e = value(e);
+        emit(wide(e.type) ? "    cbz x0, .Lor%zu\n" : "    cbz w0, .Lor%zu\n", id);
+        literal_reg("w0", 1);
+        emit("    cbz xzr, .Lor%zu_end\n.Lor%zu:\n", id, id);
+        Expr right = value(logical_and());
+        normalize_bool(right.type);
+        emit(".Lor%zu_end:\n", id);
+        e = (Expr){&int_type, 0, -1, 0};
+    }
+    return e;
+}
+static Expr expression(void) {
+    Expr e = logical_or();
     if (take("=")) {
         if (!e.lvalue || e.type->kind == TY_ARRAY)
             error("assignment requires a local variable or dereferenced object on the left");
@@ -1151,6 +1380,21 @@ static Expr expression(void) {
         store_value(e.type, "x9");
         right.zero = 0; /* An assignment is not an integer constant expression. */
         return right;
+    }
+    int pluseq = take("+=");
+    if (pluseq || take("-=")) {
+        if (!e.lvalue || e.type->kind == TY_ARRAY)
+            error("compound assignment requires a local variable or dereferenced object on the left");
+        /* The destination address is evaluated once and reused. */
+        emit("    sub sp, sp, #16\n    str x0, [sp]\n");
+        Expr right = value(expression());
+        emit("    ldr x9, [sp]\n");
+        load_value_reg(e.type, "x9");
+        Expr res = binary_add((Expr){e.type, 0, -1, 0}, right, !pluseq);
+        res = convert(res, e.type);
+        emit("    ldr x11, [sp]\n    add sp, sp, #16\n");
+        store_value(e.type, "x11");
+        return (Expr){e.type, 0, -1, 0};
     }
     return e;
 }
@@ -1306,11 +1550,149 @@ static void statement(void) {
         condition_comment(start);
         expect("("); Expr cond = value(expression()); expect(")");
         emit("    cbz %s0, .Lendwhile%zu\n", wide(cond.type) ? "x" : "w", id);
+        push_break(".Lendwhile%zu", id);
         statement();
+        pop_break();
         emit("    cbz xzr, .Lwhile%zu\n.Lendwhile%zu:\n", id, id);
         return;
     }
+    if (take("for")) {
+        size_t id = next_label++;
+        condition_comment(start);
+        expect("(");
+        if (strcmp(current()->text, ";")) {
+            Expr init = expression();
+            if (init.type->kind != TY_VOID) value(init);
+        }
+        expect(";");
+        emit(".Lfor%zu:\n", id);
+        if (strcmp(current()->text, ";")) {
+            Expr cond = value(expression());
+            emit("    cbz %s0, .Lendfor%zu\n", wide(cond.type) ? "x" : "w", id);
+        }
+        expect(";");
+        /* Parse the step now but emit it after the body: buffer its code. */
+        FILE *main_stream = body, *step_buffer = NULL;
+        if (strcmp(current()->text, ")")) {
+            step_buffer = tmpfile();
+            if (!step_buffer) fatal("cannot create step buffer: %s", strerror(errno));
+            body = step_buffer;
+            Expr step = expression();
+            if (step.type->kind != TY_VOID) value(step);
+        }
+        expect(")");
+        body = main_stream;
+        push_break(".Lendfor%zu", id);
+        statement();
+        pop_break();
+        if (step_buffer) {
+            if (fflush(step_buffer) || fseek(step_buffer, 0, SEEK_SET))
+                fatal("cannot rewind step buffer");
+            int sch;
+            while ((sch = fgetc(step_buffer)) != EOF) fputc(sch, body);
+            if (ferror(body)) fatal("cannot write assembly buffer");
+            fclose(step_buffer);
+        }
+        emit("    cbz xzr, .Lfor%zu\n.Lendfor%zu:\n", id, id);
+        return;
+    }
+    if (take("do")) {
+        size_t id = next_label++;
+        emit(".Ldo%zu:\n", id);
+        push_break(".Ldo_end%zu", id);
+        statement();
+        pop_break();
+        expect("while");
+        condition_comment(pos);
+        expect("("); Expr cond = value(expression()); expect(")");
+        emit("    cbz %s0, .Ldo_end%zu\n", wide(cond.type) ? "x" : "w", id);
+        emit("    cbz xzr, .Ldo%zu\n.Ldo_end%zu:\n", id, id);
+        expect(";");
+        return;
+    }
+    if (take("switch")) {
+        size_t id = next_label++;
+        condition_comment(start);
+        expect("(");
+        Expr v = value(expression());
+        expect(")");
+        if (!(integer(v.type) || v.type->kind == TY_PTR))
+            error("switch requires an integer or pointer expression");
+        int slot = allocate(v.type);
+        emit("    add x10, x29, #%d\n", slot);
+        store_value(v.type, "x10");
+        emit("    cbz xzr, .Lsw%zu_disp\n", id);
+        ++switch_depth;
+        switch_ids[switch_depth] = id;
+        switch_case_count[switch_depth] = 0;
+        switch_has_default[switch_depth] = 0;
+        push_break(".Lsw%zu_end", id);
+        statement();
+        pop_break();
+        emit("    cbz xzr, .Lsw%zu_end\n", id);
+        emit(".Lsw%zu_disp:\n", id);
+        emit("    add x9, x29, #%d\n", slot);
+        if (wide(v.type)) emit("    ldr x9, [x9]\n");
+        else emit("    ldr w9, [x9]\n");
+        int count = switch_case_count[switch_depth];
+        for (int i = 0; i < count; ++i) {
+            int val = switch_cases[switch_depth][i].value;
+            size_t label = switch_cases[switch_depth][i].label;
+            literal_reg("w0", (uint32_t)val);
+            if (wide(v.type)) {
+                emit("    sub x10, x10, x10\n    add x0, x10, w0, sxtw\n");
+            }
+            comparison(v.type, "==");
+            emit("    cbz w0, .Lsw%zu_n%d\n", id, i);
+            emit("    cbz xzr, .Lcse%zu_%zu\n", id, label);
+            emit(".Lsw%zu_n%d:\n", id, i);
+        }
+        if (switch_has_default[switch_depth]) emit("    cbz xzr, .Ldfl%zu\n", id);
+        else emit("    cbz xzr, .Lsw%zu_end\n", id);
+        emit(".Lsw%zu_end:\n", id);
+        --switch_depth;
+        return;
+    }
     annotate_statement();
+    if (take("break")) {
+        expect(";");
+        if (!break_depth) error("break outside a loop or switch");
+        emit("    cbz xzr, %s\n", break_names[break_depth - 1]);
+        return;
+    }
+    if (take("continue")) {
+        expect(";");
+        error("continue is not supported yet");
+    }
+    if (take("case") || take("default")) {
+        int is_default = !strcmp(tokens[pos - 1].text, "default");
+        if (!switch_depth)
+            error(is_default ? "default label outside a switch"
+                             : "case label outside a switch");
+        int value = 0;
+        if (!is_default) {
+            if (switch_case_count[switch_depth] >= MAX_CASES)
+                error("too many case labels");
+            value = enum_value();
+        }
+        expect(":");
+        size_t id = switch_ids[switch_depth];
+        if (is_default) {
+            if (switch_has_default[switch_depth]) error("duplicate default label");
+            switch_has_default[switch_depth] = 1;
+            emit(".Ldfl%zu:\n", id);
+        } else {
+            size_t label = next_label++;
+            for (int i = 0; i < switch_case_count[switch_depth]; ++i)
+                if (switch_cases[switch_depth][i].value == value)
+                    error("duplicate case value");
+            switch_cases[switch_depth][switch_case_count[switch_depth]++] =
+                (CaseLabel){label, value};
+            emit(".Lcse%zu_%zu:\n", id, label);
+        }
+        /* Fallthrough: the following statements belong to this case. */
+        return;
+    }
     if (take("return")) {
         if (functions[current_function].result->kind == TY_VOID) {
             if (strcmp(current()->text, ";")) error("void function cannot return a value");

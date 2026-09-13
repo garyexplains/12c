@@ -147,13 +147,26 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   precedence. Parentheses override precedence. Mixed-width operands follow the
   usual arithmetic conversions across `char`, `_Bool`, `int`, `unsigned`,
   `long`, and `unsigned long`, so 64-bit math stays at 64 bits.
+- Integer multiplication `*` and division `/` with C precedence (binding
+  more tightly than `+`/`-`), signed truncation toward zero, and
+  two's-complement wrapping. Multiplication at both widths and division at
+  32-bit width are synthesized from `ADD`/`SUB`/`CBZ`/`TBZ`; 64-bit division
+  is not supported yet.
+- Logical negation `!`, short-circuit `&&` and `||` (the right side is
+  evaluated only when the left side requires it), and bitwise `|`, with the
+  logical forms yielding exactly `0` or `1`.
 - Signed and unsigned integer comparisons `==`, `!=`, `<`, `<=`, `>`, and `>=`,
   returning exactly `0` or `1` at the common operands' width and signedness.
   Arithmetic binds more tightly than ordering comparisons,
   which bind more tightly than equality comparisons; assignment binds last.
-- Assignment to existing locals, including chained assignments (`a = b = 65`)
-  and assignments used as expressions (`putchar(a = 65)`).
-- `if`/`else`, including `else if`, and `while` loops. Conditions accept integer
+- Assignment to existing locals, including chained assignments (`a = b = 65`),
+  compound assignments (`+=`, `-=`) that evaluate their destination address
+  once, prefix `++` and `--`, and assignments used as expressions
+  (`putchar(a = 65)`).
+- `if`/`else`, including `else if`; `while`, `do`/`while`, and `for` loops
+  (the `for` header accepts expressions, not declarations); `switch` with
+  integer/pointer dispatch, `case` labels with fallthrough, `default`, and
+  `break` targeting the nearest enclosing loop or switch. Conditions accept integer
   or pointer expressions: zero/null is false and other values are true. Bodies may be
   single statements or blocks; declarations require a block. An `else` belongs
   to the nearest unmatched `if`.
@@ -175,11 +188,10 @@ system headers. Repeated includes work because matching prototypes may repeat.
 General preprocessing, macros, other includes, and trailing comments on include
 directives are not supported yet.
 
-Multiplication, division, other binary operators, compound assignments (`+=`),
-increment/decrement, logical operators (`!`, `&&`, `||`), `break`, `continue`,
-`for`, function pointers, variadic calls, more than eight parameters,
-and floating point remain future work. `const`,
-`void` objects/pointers, and parenthesized declarators are not supported yet.
+Bitwise AND, XOR, shifts, compound assignments beyond `+=`/`-=`, postfix
+`++`/`--`, `continue`, `goto`, and 64-bit division remain future work.
+`const`, `void` objects/pointers, and parenthesized declarators are not
+supported yet.
 Neither are pointer ordering,
 pointer-to-pointer subtraction, or general computed null pointer constants.
 Scalar self-initializer reads, enumerator arithmetic in initializers,
@@ -224,7 +236,10 @@ the integer index (`sxtw`, or `uxtw` for unsigned types) and uses shifted `ADD`
 forms to scale it, retaining the
 12-mnemonic vocabulary. Member access adds constant member offsets through
 the frame or global address; aggregate assignment copies bytes through a
-`CBZ`-terminated register-offset loop. A conservative code-size
+`CBZ`-terminated register-offset loop. Multiplication unrolls one shifted
+`ADD` per multiplier bit behind a `TBZ` test; division unrolls a restoring
+binary long-division loop with the same mnemonics, guarding the 64-bit
+overflow case with a leading comparison. A conservative code-size
 limit keeps literal loads and return branches in range. Unwind metadata is not
 implemented yet.
 
@@ -252,7 +267,12 @@ Aggregate tests cover struct and union layout against system-compiled sizes,
 member access with `.` and `->`, nested anonymous records, union aliasing,
 member addresses, struct and self-assignment, multidimensional arrays with
 row-major indexing and row-pointer arithmetic, `sizeof`, and zero-initialized
-global arrays and records.
+global arrays and records. Expression and control-flow tests cover signed
+and unsigned multiplication and division including `INT_MIN` and wraparound
+edges, `!`, short-circuit `&&`/`||` verified through call side effects,
+bitwise `|`, `+=`/`-=`/prefix `++`/`--` on scalar, indexed, and pointer
+targets, `for` and `do`/`while` loops with `break`, and `switch`
+dispatch/fallthrough/`default` with nested break targets.
 On Linux with `objdump`, it audits
 the actual machine instructions in generated functions, disabling disassembler aliases so
 `ADD x29, sp, #0` is not displayed as `MOV`. Native execution tests are skipped on

@@ -107,7 +107,6 @@ class CompilerTests(unittest.TestCase):
             ("int main(){return missing;}", "unknown local"),
             ("int main(){int a=1;int a=2;return 0;}", "duplicate local"),
             ("int main(){int a=a;return 0;}", "unknown local"),
-            ("int main(){return 1*2;}", "expected ';'"),
             ("int main(){1=2;}", "assignment requires a local"),
             ("int main(){int a=0; a+1=2;}", "assignment requires a local"),
             ("int main(){int a=0; +a=2;}", "assignment requires a local"),
@@ -115,7 +114,6 @@ class CompilerTests(unittest.TestCase):
             ("int f(int); int main(){f(1)=2;}", "assignment requires a local"),
             ("int main(){missing=1;}", "unknown local"),
             ("int main(){int a=0; a=;}", "integer expression"),
-            ("int main(){int a=0; a+=2;}", "integer expression"),
             ("int main(){return 1+;}", "integer expression"),
             ("int main(){return 0x41;}", "decimal integer"),
             ("int main(){return 065;}", "decimal integer"),
@@ -130,7 +128,6 @@ class CompilerTests(unittest.TestCase):
             ("int main(){if(1) int a=1;}", "integer expression"),
             ("int main(){if() return 1;}", "integer expression"),
             ("int main(){else return 1;}", "integer expression"),
-            ("int main(){while(1) break;}", "integer expression"),
             ("int main(){return 1<;}", "integer expression"),
             ("int main(){int a=0;(a<1)=2;}", "assignment requires a local"),
             ("int main(){return 0;} garbage", "expected 'int'"),
@@ -865,8 +862,7 @@ int main() {
             ("int main(){int a;return (int a)0;}", "casts"),
             ("int main(){char *p;return (long)p;}", "pointer to integer"),
             ("int main(){int n;int *p=&n;return p;}", "pointer to integer"),
-            ("int main(){long l;return l*2;}", "expected ';'"),
-            ("int main(){long l;return l/2;}", "unsupported character"),
+            ("int main(){long l;return l/2;}", "64-bit division"),
             ("int main(){unsigned u;return u%3;}", "unsupported character"),
             ("int main(){long l=9223372036854775808L;return 0;}", "too large for long"),
             ("int main(){unsigned u=4294967296U;return 0;}", "too large for unsigned"),
@@ -1071,6 +1067,218 @@ int main() {
                 return 0;
             }
             """)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_multiplication_division(self):
+        self.execute("""int main() {
+                if (5 * 6 != 30) return 1;
+                if (100 / 7 != 14) return 2;
+                if (-100 / 7 != -14) return 3;
+                if (100 / -7 != -14) return 4;
+                if (-100 / -7 != 14) return 5;
+                if (-7 / 2 != -3) return 6;
+                if (7 / -2 != -3) return 7;
+                if ((-2147483647 - 1) / 2 != -1073741824) return 8;
+                if (2147483647 * 2 != -2) return 9;
+                if (-13 / 4 != -3) return 10;
+                if (13 / -4 != -3) return 11;
+                if (-13 / -4 != 3) return 12;
+                if (2147483647 / 2147483647 != 1) return 13;
+                unsigned z = 4294967295U;
+                if (z / 65535U != 65537U) return 14;
+                if (0 / 5 != 0) return 15;
+                if (0 * 2147483647 != 0) return 16;
+                if (2 + 3 * 4 - 6 / 2 != 11) return 17;
+                if (7 * (3 - 1) - 2 / 2 != 13) return 18;
+                unsigned u = 2147483648U;
+                if (u * 2U != 0U) return 19;
+                if ((2147483647 * 2147483647) != 1) return 20;
+                int k = 0;
+                int i = 0;
+                for (k = 0; k < 100; k += 7) i = i + 1;
+                if (i != 15) return 21;
+                return 0;
+            }
+            """)
+        self.execute("""int main() {
+                long prod = 9223372036854775807L;
+                prod = prod * 2L;
+                if (prod != -2L) return 1;
+                prod = -9223372036854775807L * 3L;
+                if (prod != -9223372036854775805L) return 2;
+                unsigned long u = 18446744073709551615UL;
+                if (u * 3UL != 18446744073709551613UL) return 3;
+                long v = 3000000000L;
+                if (v * 2L != 6000000000L) return 4;
+                if ((long)7 * 3L != 21L) return 5;
+                if ((long)-5L * 1L != -5L) return 6;
+                return 0;
+            }
+            """)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_logical_operators(self):
+        self.execute("""#include <stdio.h>
+            int calls = 0;
+            int bump(void) { calls = calls + 1; return 1; }
+            int zero(void) { calls = calls + 1; return 0; }
+            int main() {
+                if (!0 != 1) return 1;
+                if (!5 != 0) return 2;
+                if (!(3 && 4)) return 3;
+                if (0 && 4) return 4;
+                if (0 || 0) return 5;
+                if (!(0 || 7)) return 6;
+                if (!(12 | 10) != 0) return 7;
+                if ((0 | 0) != 0) return 8;
+                calls = 0;
+                if (zero() && bump()) return 9;
+                if (calls != 1) return 10;
+                calls = 0;
+                if (bump() && zero()) return 11;
+                if (calls != 2) return 12;
+                calls = 0;
+                if (!(bump() || zero())) return 13;
+                if (calls != 1) return 14;
+                calls = 0;
+                if (zero() || zero()) return 15;
+                if (calls != 2) return 16;
+                calls = 0;
+                if (!(bump() && !zero())) return 17;
+                if (calls != 2) return 18;
+                putchar(70);
+                return 0;
+            }
+            """, b"F")
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_compound_and_increment(self):
+        self.execute("""int main() {
+                int a = 5;
+                a += 3;
+                if (a != 8) return 1;
+                a -= 10;
+                if (a != -2) return 2;
+                ++a;
+                if (a != -1) return 3;
+                --a; --a;
+                if (a != -3) return 4;
+                if (++a != -2) return 5;
+                if (--a != -3) return 6;
+                char c = 100;
+                c += 100;
+                if (c != 200) return 7;
+                long big = 3000000000L;
+                big += big;
+                if (big != 6000000000L) return 8;
+                int arr[4] = {1, 2, 0, 0};
+                arr[2] += 5;
+                if (arr[2] != 5) return 8;
+                int i = 1;
+                arr[i] -= 1;
+                if (arr[1] != 1) return 9;
+                ++arr[0];
+                if (arr[0] != 2) return 10;
+                --arr[3];
+                if (arr[3] != -1) return 11;
+                int *p = arr + 1;
+                *p += 9;
+                if (arr[1] != 10) return 12;
+                ++*p;
+                if (arr[1] != 11) return 12;
+                int b = 0;
+                b = ++a + 1;
+                if (a != -2) return 13;
+                if (b != -1) return 14;
+                return 0;
+            }
+            """)
+
+    @unittest.skipUnless(NATIVE, "requires a native AArch64 host")
+    def test_native_for_do_switch(self):
+        self.execute("""#include <stdio.h>
+            enum Op { O1 = 1, O2 = 2, O3 = 3 };
+            int main() {
+                enum Op o = O2;
+                int hit = 0;
+                switch (o) {
+                    case O1: hit = 1; break;
+                    case O2: hit = 2; break;
+                    case O3: hit = 3; break;
+                }
+                if (hit != 2) return 1;
+                switch (o) {
+                    case O1: hit = 11; break;
+                    default: hit = 99; break;
+                }
+                if (hit != 99) return 2;
+                int fall = 0;
+                switch (o) {
+                    case O2: fall = fall + 1;
+                    case O3: fall = fall + 10; break;
+                    default: fall = 100; break;
+                }
+                if (fall != 11) return 3;
+                int brk = 0;
+                int i = 0;
+                for (i = 0; i < 10; ++i) {
+                    if (i == 4) break;
+                    brk = i;
+                }
+                if (brk != 3) return 4;
+                while (1) { break; }
+                switch (5) { default: break; }
+                int nested = 0;
+                for (i = 0; i < 3; ++i) {
+                    int j = 0;
+                    while (j < 3) {
+                        if (j == 2) break;
+                        ++j;
+                    }
+                    if (j == 2) { if (i == 2) break; }
+                    ++nested;
+                }
+                if (nested != 2) return 5;
+                int total = 0;
+                i = 0;
+                for (i = 0; i < 5; ++i) {
+                    int j = 0;
+                    do { total = total + 1; ++j; } while (j < i);
+                }
+                if (total != 11) return 6;
+                int loops = 0;
+                for (i = 10; i > 7; --i) ++loops;
+                if (loops != 3) return 7;
+                int empt = 0;
+                for (i = 0; i < 0; ++i) ++loops;
+                do ++loops; while (0);
+                if (loops != 4) return 8;
+                putchar(71);
+                return 0;
+            }
+            """, b"G")
+
+    def test_invalid_control_flow(self):
+        cases = [
+            ("int main(){continue;}", "continue"),
+            ("int main(){while(1) continue;}", "continue"),
+            ("int main(){break;}", "break outside"),
+            ("int main(){case 1: return 0;}", "case label outside"),
+            ("int main(){default: return 0;}", "default label outside"),
+            ("int main(){switch(1){case 1:case 1:return 0;}}", "duplicate case value"),
+            ("int main(){switch(1){case 1:break;default:break;default:break;}}", "duplicate default label"),
+            ("int main(){switch(1){case 1+1:break;}}", "expected ':'"),
+            ("int main(){switch(120){case 120:break;default:break;}}", None),
+        ]
+        for case in cases:
+            source, message = case[0], case[1]
+            with self.subTest(source=source):
+                result, _ = self.compile(source)
+                if message is None:
+                    self.assertEqual(result.returncode, 0)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message.encode(), result.stderr)
 
     def test_invalid_aggregates(self):
         cases = [

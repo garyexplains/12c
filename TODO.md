@@ -64,6 +64,22 @@ The first milestone is implemented in [src/4c.c](src/4c.c):
 - [x] Regression coverage: the latest implementation run passed all 50 tests,
   adding struct/union layout, member operations, multidimensional arrays,
   sizeof, and zero-initialized global aggregate checks.
+- [x] Integer multiplication and division, including long operations used by
+  the driver, with C precedence, signed truncation toward zero, and
+  two's-complement wrapping; synthesized from ADD/SUB/CBZ/TBZ only.
+- [x] Logical negation, short-circuit && and ||, and bitwise OR; Proc_4's
+  `Bool_Loc | Bool_Glob` lowers as a bitwise operation.
+- [x] += and -=, and prefix ++, for scalar and indexed lvalues, evaluating
+  the destination address once and applying the destination type's
+  conversion.
+- [x] for loops and do/while loops, with break targeting the nearest
+  enclosing loop or switch.
+- [x] switch, case labels with fallthrough, default, and break, exercised by
+  Proc_6's enum dispatch.
+- [x] Regression coverage: the latest implementation run passed all 55 tests,
+  adding multiplication/division edges, logical short-circuit side-effect
+  checks, bitwise OR, compound assignment/increment targets, and
+  for/do/switch control-flow checks.
 
 Other existing foundations include int/char/pointer parameters and results,
 recursion, local one-dimensional arrays, strings, pointer indexing, assignment,
@@ -125,19 +141,21 @@ and record copies. Aggregate arguments/results by value are not needed here.
 
 ### 3. Complete the benchmark's expressions and control flow
 
-- [ ] Integer multiplication and division, including long operations used by the
+Implemented; see the checked items in Current status above.
+
+- [x] Integer multiplication and division, including long operations used by the
   driver. Preserve precedence, signed behavior, and intermediate values across calls.
-- [ ] Logical negation, short-circuit && and ||, and bitwise OR. Proc_4 uses
+- [x] Logical negation, short-circuit && and ||, and bitwise OR. Proc_4 uses
   `Bool_Loc | Bool_Glob`; that is a bitwise operation, not logical OR.
-- [ ] += and -=, and prefix ++, for scalar and indexed lvalues. Evaluate the
+- [x] += and -=, and prefix ++, for scalar and indexed lvalues. Evaluate the
   destination address once and apply the destination type's conversion.
-- [ ] for loops and do/while loops.
-- [ ] switch, case labels, and break, with the correct enclosing break target
+- [x] for loops and do/while loops.
+- [x] switch, case labels, and break, with the correct enclosing break target
   and fallthrough behavior. Proc_6 exercises enum dispatch.
 
 Synthesize arithmetic using the allowed instructions; do not emit MUL or SDIV
-silently. Keep TBZ targets in range and revisit function/literal-pool size limits
-if synthesized operations make generated functions too large.
+silently. Keep TBZ targets in range and revisit function/literal-pool size
+limits if synthesized operations make generated functions too large.
 
 ### 4. Supply preprocessing, headers, and the integer library ABI
 
