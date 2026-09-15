@@ -1,0 +1,8 @@
+/* Integer limits for the supported AArch64 LP64 targets. */
+#define CHAR_BIT 8
+#define INT_MAX 2147483647
+#define INT_MIN (-2147483647 - 1)
+#define UINT_MAX 4294967295U
+#define LONG_MAX 9223372036854775807L
+#define LONG_MIN (-9223372036854775807L - 1L)
+#define ULONG_MAX 18446744073709551615UL

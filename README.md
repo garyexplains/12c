@@ -9,6 +9,14 @@ instruction vocabulary. Generated programs may be inefficient. The restriction
 should still allow general computation, ordinary functions, recursion, pointers,
 and clean calls into the platform's C library.
 
+For a guided explanation of assignments, stack frames, calls, control flow and
+arithmetic, read [From C to twelve AArch64 instructions](ASSEMBLY_GUIDE.md).
+Generated assembly includes a plain-language action and purpose for every
+instruction, alongside the source-statement comments.
+
+The active milestone is [self-hosting](SELF_HOSTING.md): compile this compiler's
+own source and both implementation headers using the same twelve instructions.
+
 Phase one is implemented in C. It compiles the example below into native assembly
 and uses our own minimal `include/stdio.h` for the `putchar` declaration. The rest
 of this README describes both the current implementation and the broader design.
@@ -68,6 +76,16 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   Plain `char` is unsigned on AArch64 Linux and signed on macOS, following
   each target's default ABI. Character expressions promote to `int`. `_Bool`
   storage normalizes every nonzero scalar value to 1 and zero to 0.
+- On Linux, eight-byte binary64 `double`: decimal literals (`.5`, `1.0`, `1e-3`),
+  locals, globals with simple numeric initializers, arrays, member storage,
+  parameters/results, unary signs, scalar truth tests and conversion to `_Bool`.
+  Signed/unsigned integer-to-double conversions and double `*`/`/` are computed
+  in software with round-to-nearest/ties-to-even, including subnormals, signed
+  zeros, infinities and NaNs. Mixed integer/double multiplication and division
+  convert the integer operand first. Double addition/subtraction, comparisons,
+  increment, double-to-integer casts, `float`, hex floating literals, suffixes,
+  floating-environment exceptions and dynamic rounding modes remain unsupported.
+  macOS double support is explicitly rejected pending its ABI implementation.
 - Enum types: `enum` tags with block scoping and same-scope redefinition
   checks. Enumerator constants join the ordinary identifier namespace with
   sequential values or explicit initializers (a decimal literal, another
@@ -105,7 +123,7 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   frame limit; global aggregate initializers, `extern`, `static`, address
   initializers, and general constant expressions remain unsupported.
 - User-defined functions returning `void`, `_Bool`, `char`, `int`,
-  `unsigned`, `long`, `unsigned long`, or a pointer, with zero to eight
+  `unsigned`, `long`, `unsigned long`, a pointer, or Linux `double`, with zero to eight
   parameters of those types,
   including recursion and mutual recursion through forward prototypes. Functions
   must be declared or defined before a call; a definition declares the function
@@ -147,21 +165,26 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   precedence. Parentheses override precedence. Mixed-width operands follow the
   usual arithmetic conversions across `char`, `_Bool`, `int`, `unsigned`,
   `long`, and `unsigned long`, so 64-bit math stays at 64 bits.
-- Integer multiplication `*` and division `/` with C precedence (binding
+- Integer multiplication `*`, division `/`, and remainder `%` with C precedence (binding
   more tightly than `+`/`-`), signed truncation toward zero, and
-  two's-complement wrapping. Multiplication at both widths and division at
-  32-bit width are synthesized from `ADD`/`SUB`/`CBZ`/`TBZ`; 64-bit division
-  is not supported yet.
+  two's-complement wrapping. All three support 32-bit and 64-bit integers and
+  are synthesized from `ADD`/`SUB`/`CBZ`/`TBZ`. Remainders follow the dividend's
+  sign. Division by zero and signed minimum divided by -1 remain undefined C.
 - Logical negation `!`, short-circuit `&&` and `||` (the right side is
-  evaluated only when the left side requires it), and bitwise `|`, with the
+  evaluated only when the left side requires it), and bitwise `&`, `^`, `|`,
+  and `~`, with the
   logical forms yielding exactly `0` or `1`.
+- Conditional expressions `condition ? yes : no`, evaluating only the selected
+  arm and converting it to the common result type. These bind more tightly than
+  assignment and less tightly than logical OR.
 - Signed and unsigned integer comparisons `==`, `!=`, `<`, `<=`, `>`, and `>=`,
   returning exactly `0` or `1` at the common operands' width and signedness.
   Arithmetic binds more tightly than ordering comparisons,
   which bind more tightly than equality comparisons; assignment binds last.
 - Assignment to existing locals, including chained assignments (`a = b = 65`),
-  compound assignments (`+=`, `-=`) that evaluate their destination address
-  once, prefix `++` and `--`, and assignments used as expressions
+  compound assignments (`+=`, `-=`, and all integer arithmetic/bitwise/shift
+  compound forms) that evaluate their destination address once, prefix and
+  postfix `++` and `--`, and assignments used as expressions
   (`putchar(a = 65)`).
 - `if`/`else`, including `else if`; `while`, `do`/`while`, and `for` loops
   (the `for` header accepts expressions, not declarations); `switch` with
@@ -181,13 +204,15 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   expression statements, but cannot be used where a value is required.
   Falling off the end of `main` returns zero.
 - Line comments, block comments, and a controlled built-in preprocessor:
-
-- Line comments, block comments, and a controlled built-in preprocessor:
   `#include <name.h>` resolves headers from `-I`/the built-in include
   directory, and `#define` supports object-like macros and zero-parameter
   function-like macros with rescanning, so nested uses such as
-  `#define Too_Small_Time (2 * CLOCKS_PER_SEC)` expand fully. Parameterized
-  macros, conditionals (`#if`/`#ifdef`), and line markers are rejected;
+  `#define Too_Small_Time (2 * CLOCKS_PER_SEC)` expand fully. Quoted includes
+  search relative to the including file before the include directory.
+  `#ifdef`, `#ifndef`, `#else`, `#endif`, and `#undef` support guarded headers
+  and target selection (`__APPLE__`/`__linux__`). Parameter substitution and
+  token pasting support integer constant macros such as `UINT64_C`.
+  `#if` expressions and line markers are still rejected;
   `#` is only valid at the start of a directive line. Trailing comments on
   directive lines are allowed.
 
@@ -208,13 +233,17 @@ ABI for integer, character, and pointer arguments.
 `main` may be defined as `main(int argc, char *argv[])`, with argv decaying
 to `char **`.
 
-Bitwise AND, XOR, shifts, compound assignments beyond `+=`/`-=`, postfix
-`++`/`--`, `continue`, `goto`, and 64-bit division remain future work.
+Integer shifts `<<` and `>>` support runtime counts; signed right shift propagates
+the sign bit. Shift counts outside the operand width are undefined C.
+`continue` and `goto` remain future work. Floating-point compound multiplication
+and division are not implemented yet.
 `const` is accepted and ignored in declaration specifiers; `void` objects
 are unsupported, but `void` pointers convert freely with other object
 pointers as C allows. Parenthesized declarators are not supported yet.
-Neither are pointer ordering,
-pointer-to-pointer subtraction, or general computed null pointer constants.
+Compatible object pointers support ordering and subtraction. Subtraction returns
+the signed element distance; C requires both pointers to refer into the same
+array (including its one-past position). General computed null pointer constants
+are not supported.
 Scalar self-initializer reads, enumerator arithmetic in initializers,
 and the literal expression `-2147483648` are also
 outside this subset. Array lengths must be decimal literals; an omitted length
@@ -230,9 +259,11 @@ separate 16-byte aligned frame with saved frame/link registers for each
 function. Each
 function has its own return epilogue and literal pool, with unique labels.
 Arguments are evaluated left-to-right into aligned temporary stack slots, then
-loaded into `w0` through `w7` (or `x0` through `x7` for 64-bit types) before the call. Callees save incoming
+loaded into `w0` through `w7` (or `x0` through `x7` for 64-bit integers/pointers) before the call.
+Linux doubles independently use `d0` through `d7`, including variadic arguments;
+the existing limit remains eight total arguments. Callees save incoming
 parameters in their frames before executing the body. Results are returned in
-`w0` for 32-bit integers and `x0` for 64-bit types. Character and `_Bool`
+`w0` for 32-bit integers, `x0` for 64-bit integers/pointers, and `d0` for doubles. Character and `_Bool`
 arguments and results are narrowed and extended according to the target.
 These conventions permit calls
 between generated and system-compiled C.
@@ -264,7 +295,52 @@ overflow case with a leading comparison. A conservative code-size
 limit keeps literal loads and return branches in range. Unwind metadata is not
 implemented yet.
 
+### Run Dhrystone on AArch64 Linux
+
+The unchanged benchmark now compiles and runs, including floating-point timing:
+
+```sh
+make dhrystone
+./build/dhry 10000000
+make test-dhrystone
+```
+
+`make dhrystone` runs 4c on `examples/dhry.c`, then uses the system compiler only
+to assemble/link `build/dhry.s`. Binary64 routines are embedded source compiled
+by 4c and included in the emitted assembly; no system-compiled arithmetic helper
+is linked. The source file is unchanged. The benchmark increases the iteration
+count until a measurement takes at least two seconds of process CPU time.
+Its final array counter includes iterations from every attempt, so its printed
+`Number_Of_Runs + 10` expectation is only accurate when no retries occurred.
+Results validate correctness; this single-translation-unit benchmark is not a
+controlled performance comparison with historical Dhrystone results.
+
 ### Tests
+
+`make test-dhrystone` runs three native AArch64 Linux checks: the earlier
+fixed-iteration integer fixture, unchanged-source execution with the real clock,
+and unchanged-source execution with a controlled clock to compare retry behavior
+and exact timing output with system C. Tests check final scalar/record/string
+values, pointer relationships, argument handling and the accumulated array
+counter. Generated code, including software arithmetic, is assembled and audited
+with objdump when available. Binary64 implementation details and limits are in
+[FLOATING_POINT.md](FLOATING_POINT.md).
+
+Run `make test-sanitize` to build the compiler with AddressSanitizer and
+UndefinedBehaviorSanitizer and run the same suite. This requires a host compiler
+with both sanitizers. Leak detection is disabled because the compiler retains
+tokens and type allocations for its process lifetime; memory-access and
+undefined-behavior checks remain enabled. `TEST_COMPILER` can select another
+compiler executable when running `python3 tests/test.py` directly.
+
+The `test_review_*` regressions cover mixed-width operations, boolean globals,
+union layout, switch promotion and nesting, preprocessing, record compatibility,
+external definitions, and wide bitwise OR. Native cases compare results with
+system-compiled C and assemble/link generated code, catching invalid operand
+forms as well as incorrect results. Apple Silicon-only tests separately check
+variadic argument placement and the `stderr` symbol; these are skipped elsewhere.
+These regressions currently expose known compiler bugs and are intentionally
+not marked as expected failures.
 
 `make test` checks syntax errors, header lookup, target-specific assembly, and
 the allowed instruction vocabulary. On a native AArch64 host, it also links and
@@ -332,10 +408,8 @@ cc build/strings.s -o build/strings
 ```
 
 `examples/globals.c` combines typedef aliases, global scalar storage, and void
-procedures. It checks a shared counter and prints `A`. These features are the
-first milestone toward `examples/dhry.c`; Dhrystone still needs preprocessing,
-enums/booleans, aggregates, additional operators/control flow, and library/ABI
-support including floating-point reporting.
+procedures. It checks a shared counter and prints `A`. The unchanged
+`examples/dhry.c` now passes the Linux integration checks described above.
 
 `examples/arrays.c` demonstrates a mutable character array, array indexing,
 address-of, pointer assignment, and passing an array to a function.
@@ -514,10 +588,12 @@ Platform details include:
 - Narrow argument extension, stack argument layout, and frame conventions must
   follow the target ABI rather than assuming all arm64 platforms are identical.
 
-Passing and receiving `float` or `double` can use floating-point register forms of
-`LDR` and `STR` without increasing the mnemonic count. Floating-point arithmetic,
-numeric conversions, aggregate arguments, and full C ABI coverage are separate
-implementation work and are not promised by the initial subset.
+Linux double transport uses `LDR Dn` and `STR Dn` without increasing the mnemonic
+count. The allowed forms use `d0` through `d7` with stack/frame addresses and
+immediate offsets. Internal values remain integer-register bit patterns; software
+arithmetic is compiled by 4c under the same whitelist. `float`, aggregate
+arguments, additional double operations and full C ABI coverage remain separate
+work.
 
 The macOS target is ordinary `arm64`; an `arm64e` pointer-authentication ABI is
 outside the initial scope.

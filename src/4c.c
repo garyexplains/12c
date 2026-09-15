@@ -1,11 +1,16 @@
 #include <ctype.h>
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "softfloat.h"
+
+_Static_assert(sizeof(double) == 8 && FLT_RADIX == 2 && DBL_MANT_DIG == 53 &&
+               DBL_MAX_EXP == 1024, "4c requires a binary64 host double");
 
 #ifndef DEFAULT_INCLUDE_DIR
 #define DEFAULT_INCLUDE_DIR "include"
@@ -18,9 +23,10 @@ typedef struct {
     const char *file;
     int line;
     const char *source;
+    uint64_t hidden_macros[2]; /* Macros disabled while rescanning this token. */
 } Token;
 
-typedef enum { TY_BOOL, TY_CHAR, TY_INT, TY_UINT, TY_LONG, TY_ULONG,
+typedef enum { TY_BOOL, TY_CHAR, TY_INT, TY_UINT, TY_LONG, TY_ULONG, TY_DOUBLE,
                 TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_VOID } TypeKind;
 typedef struct Member Member;
 typedef struct Type {
@@ -43,9 +49,11 @@ static Type bool_type = {TY_BOOL, NULL, 1, 1, NULL, 0},
             uint_type = {TY_UINT, NULL, 4, 4, NULL, 0};
 static Type long_type = {TY_LONG, NULL, 8, 8, NULL, 0},
             ulong_type = {TY_ULONG, NULL, 8, 8, NULL, 0};
+static Type double_type = {TY_DOUBLE, NULL, 8, 8, NULL, 0};
+static int need_softfloat, compiling_softfloat;
 static int alignment(Type *t) {
     switch (t->kind) {
-    case TY_PTR: case TY_LONG: case TY_ULONG: return 8;
+    case TY_PTR: case TY_LONG: case TY_ULONG: case TY_DOUBLE: return 8;
     case TY_INT: case TY_UINT: return 4;
     case TY_ARRAY: return alignment(t->base);
     case TY_STRUCT: case TY_UNION: return t->align;
@@ -58,6 +66,7 @@ static String *strings;
 static size_t nstrings;
 static int frame_bytes, max_frame_bytes;
 static int macos;
+static int suppress_emit; /* _Static_assert: drop assembly from constant expression. */
 
 typedef struct {
     char *name;
@@ -73,7 +82,10 @@ static Local locals[256];
 static size_t nlocals, scope_base, next_label;
 /* An offset of -1 marks a typedef in the ordinary identifier namespace. */
 static Local globals[256];
-static uint64_t global_values[256];
+static int global_static[256];
+typedef struct { uint64_t value; Type *type; int is_string; } InitEntry;
+static InitEntry *global_inits[256];
+static size_t global_init_counts[256];
 static size_t nglobals;
 static int find_local(const char *s);
 static int find_global(const char *s);
@@ -81,6 +93,11 @@ static int find_function(const char *s);
 static int decimal(void);
 static void comparison(Type *t, const char *op);
 static int identifier(const char *s);
+static Type *parse_abstract(void);
+static int const_expr_or(uint64_t *out);
+static int enum_constant(const char *name, int *value);
+static String decode_literal(void);
+static String string_bytes(void);
 static void fatal(const char *fmt, ...);
 static int find_global(const char *s) {
     for (size_t i = 0; i < nglobals; ++i)
@@ -97,9 +114,18 @@ static int tag_depth;
 /* Set while parsing translation-unit declarations; enumerator constants
    defined there use the global namespace instead of a block's locals. */
 static int global_scope;
-/* Token-level macro table: object-like macros and zero-parameter
-   function-like macros, expanded with rescanning after lexing. */
-typedef struct { char *name; Token *body; size_t nbody; int zero_arg; } Macro;
+/* Token-level macro table: object-like and parameterized function-like
+   macros, expanded with rescanning after lexing. Function-like macros
+   record their parameter names and a variadic flag (last param is ...). */
+typedef struct {
+    char *name;
+    Token *body;
+    size_t nbody;
+    int nparams;
+    char *params[16];
+    int variadic;
+    int function_like;
+} Macro;
 static Macro macros[128];
 static size_t nmacros;
 /* case-label records for the innermost switch, per nesting level. */
@@ -113,11 +139,19 @@ static int switch_depth;
 /* break targets: each loop or switch pushes its end label name. */
 static char break_names[32][32];
 static int break_depth;
+/* continue targets: each loop pushes a label that re-enters iteration. */
+static char continue_names[32][32];
+static int continue_depth;
 static void fatal(const char *fmt, ...);
 static void push_break(const char *kind, size_t id) {
     if (break_depth == 32) fatal("break nesting is too deep");
     snprintf(break_names[break_depth], sizeof(break_names[0]), kind, id);
     ++break_depth;
+}
+static void push_continue(const char *kind, size_t id) {
+    if (continue_depth == 32) fatal("continue nesting is too deep");
+    snprintf(continue_names[continue_depth], sizeof(continue_names[0]), kind, id);
+    ++continue_depth;
 }
 static void pop_break(void) { --break_depth; }
 static Type *alias_type(const char *s) {
@@ -133,18 +167,24 @@ static int type_start(void) {
            !strcmp(s, "void") || !strcmp(s, "_Bool") ||
            !strcmp(s, "long") || !strcmp(s, "unsigned") ||
            !strcmp(s, "enum") || !strcmp(s, "struct") ||
-           !strcmp(s, "union") || !strcmp(s, "const") || alias_type(s) != NULL;
+           !strcmp(s, "union") || !strcmp(s, "const") || !strcmp(s, "double") || alias_type(s) != NULL;
 }
 typedef struct {
     char *name;
     int nparams;
     int variadic;
     int defined;
+    int internal;
+    int static_linkage;
+    int va_save_offset;   /* offset of x0..x7 save area from x29 (variadic only) */
+    int va_tag_offset;    /* offset of __va_list_tag from x29 (variadic only) */
+    int fp_save_offset;   /* offset of d0..d7 save area from x29 (variadic only) */
+    int result_ptr_offset; /* frame slot for the x8 indirect result (big aggregates) */
     Type *result;
     Type *params[8];
 } Function;
 
-static Function functions[256];
+static Function functions[288]; /* User limit plus private software routines. */
 static size_t nfunctions;
 static uint32_t *constants;
 static size_t nconstants;
@@ -180,7 +220,7 @@ static void token(const char *s, size_t len, const char *file, int line) {
         capacity = capacity ? capacity * 2 : 128;
         tokens = resize(tokens, capacity * sizeof(*tokens));
     }
-    tokens[ntokens++] = (Token){copy(s, len), file, line, s};
+    tokens[ntokens++] = (Token){copy(s, len), file, line, s, {0, 0}};
 }
 
 static char *read_file(const char *path) {
@@ -203,12 +243,12 @@ static char *read_file(const char *path) {
 
 /* Only #include <stdio.h> is supported in phase one. No host headers or host
    preprocessor are involved. Repeated prototypes are harmless. */
-static void lex(const char *path, int depth) {
+static void lex_source(const char *path, char *data, int depth) {
     if (depth > 8) fatal("%s: include nesting too deep", path);
-    char *data = read_file(path), *p = data;
-    int line = 1, line_start = 1;
+    char *p = data;
+    int line = 1;
     while (*p) {
-        if (*p == '\n') { ++line; line_start = 1; ++p; continue; }
+        if (*p == '\n') { ++line; ++p; continue; }
         if (isspace((unsigned char)*p)) { ++p; continue; }
         if (p[0] == '/' && p[1] == '/') {
             while (*p && *p != '\n') ++p;
@@ -218,19 +258,18 @@ static void lex(const char *path, int depth) {
             int start = line;
             p += 2;
             while (*p && !(p[0] == '*' && p[1] == '/')) {
-                if (*p == '\n') { ++line; line_start = 1; }
+                if (*p == '\n') { ++line; }
                 ++p;
             }
             if (!*p) fatal("%s:%d: unterminated comment", path, start);
             p += 2;
             continue;
         }
-        if (*p == '#' && !line_start)
-            fatal("%s:%d: '#' is only valid at the start of a directive line",
-                  path, line);
-        line_start = 0;
+        /* '#' may appear inside a macro body as the stringification operator. */
         char *start = p;
-        if (*p == '"' || *p == '\'') {
+        if (p[0] == '#' && p[1] == '#') {
+            p += 2;
+        } else if (*p == '"' || *p == '\'') {
             int quote = *p++;
             while (*p && *p != quote) {
                 if (*p == '\n' || *p == '\r')
@@ -246,8 +285,14 @@ static void lex(const char *path, int depth) {
             ++p;
         } else if (isalpha((unsigned char)*p) || *p == '_') {
             do { ++p; } while (isalnum((unsigned char)*p) || *p == '_');
-        } else if (isdigit((unsigned char)*p)) {
-            do { ++p; } while (isalnum((unsigned char)*p) || *p == '_');
+        } else if (isdigit((unsigned char)*p) || (*p == '.' && isdigit((unsigned char)p[1]))) {
+            do {
+                ++p;
+                if ((*p == '+' || *p == '-') && (p[-1] == 'e' || p[-1] == 'E')) ++p;
+            } while (isalnum((unsigned char)*p) || *p == '_' || *p == '.');
+        } else if ((p[0] == '<' || p[0] == '>') && p[1] == p[0]) {
+            p += 2;
+            if (*p == '=') ++p;
         } else if ((strchr("=!<>", p[0]) && p[1] == '=')) {
             p += 2;
         } else if (p[0] == '-' && p[1] == '>') {
@@ -258,63 +303,377 @@ static void lex(const char *path, int depth) {
             p += 2;
         } else if (p[0] == '.' && p[1] == '.' && p[2] == '.') {
             p += 3;
-        } else if ((p[0] == '+' && p[1] == '=') ||
-                   (p[0] == '-' && p[1] == '=')) {
+        } else if (strchr("+-*/%&|^", p[0]) && p[1] == '=') {
             p += 2;
         } else if ((p[0] == '+' && p[1] == '+') ||
                    (p[0] == '-' && p[1] == '-')) {
             p += 2;
+        } else if (*p == '#' && p[1] == '#') {
+            /* Token-paste operator in macro bodies. */
+            p += 2;
         } else if (*p == '.') {
             ++p;
-        } else if (strchr("(){}[];=,+-<>*&/!|:#", *p)) {
+        } else if (strchr("(){}[];=,+-<>*&/!|:#?%~^", *p)) {
             ++p;
         } else {
             fatal("%s:%d: unsupported character '%c'", path, line, *p);
         }
-        token(start, (size_t)(p - start), path, line);
+        size_t len = 0;
+        for (const char *q = start; q != p && *q; ++q) ++len;
+        token(start, len, path, line);
     }
     if (!depth) token("<eof>", 5, path, line);
     /* Tokens retain source spans for assembly comments until compilation ends. */
 }
 
+static void lex(const char *path, int depth) {
+    lex_source(path, read_file(path), depth);
+}
+
 static void splice_tokens(size_t at, size_t consumed, const Token *newtoks, size_t nnew) {
+    Token *result;
     size_t tail = ntokens - at - consumed;
     size_t total = at + nnew + tail;
-    Token *result = resize(NULL, (total ? total : 1) * sizeof(Token));
+    result = resize(NULL, (total ? total : 1) * sizeof(Token));
     if (at) memcpy(result, tokens, at * sizeof(Token));
     if (nnew) memcpy(result + at, newtoks, nnew * sizeof(Token));
     if (tail) memcpy(result + at + nnew, tokens + at + consumed, tail * sizeof(Token));
+    free(tokens);
     tokens = result;
     capacity = total ? total : 1;
     ntokens = total;
 }
-/* Resolve #include directives and #define macros over the token array,
-   then expand macros with rescanning to a fixed point. */
+static int macro_defined(const char *name) {
+    if (!strcmp(name, "__APPLE__")) return macos;
+    if (!strcmp(name, "__linux__")) return !macos;
+    for (size_t k = 0; k < nmacros; ++k)
+        if (!strcmp(macros[k].name, name)) return 1;
+    return 0;
+}
+/* Expand in source order. Replacement tokens inherit a hide set, preventing
+   self/mutual recursion while still allowing rescanning of nested macros. */
 static void preprocess(void) {
+    size_t expansions = 0;
+    int depth = 0, active = 1;
+    int parent[128], selected[128], saw_else[128];
+    const char *conditional_file[128];
     for (size_t i = 0; i < ntokens; ) {
-        if (strcmp(tokens[i].text, "#")) { ++i; continue; }
+        if (strcmp(tokens[i].text, "#")) {
+            if (!active && strcmp(tokens[i].text, "<eof>")) {
+                size_t end = i + 1;
+                while (end < ntokens && strcmp(tokens[end].text, "#") &&
+                       strcmp(tokens[end].text, "<eof>")) ++end;
+                splice_tokens(i, end - i, NULL, 0);
+                continue;
+            }
+            size_t k;
+            for (k = 0; k < nmacros; ++k)
+                if (!strcmp(macros[k].name, tokens[i].text) &&
+                    !(tokens[i].hidden_macros[k / 64] & (UINT64_C(1) << (k % 64))))
+                    break;
+            if (k == nmacros) { ++i; continue; }
+            Macro *m = &macros[k];
+            size_t consumed = 1;
+            /* Parse function-like argument list if this macro has parameters. */
+            Token **args = NULL;
+            size_t *args_len = NULL;
+            int nargs = 0;
+            /* Zero-arg function-like: require "()" right after name. */
+            if (m->function_like && !m->nparams && !m->variadic) {
+                if (i + 2 >= ntokens || strcmp(tokens[i + 1].text, "(") ||
+                    strcmp(tokens[i + 2].text, ")")) {
+                    ++i; continue;
+                }
+                consumed = 3;
+            } else if (m->nparams || m->variadic) {
+                if (i + 1 >= ntokens || strcmp(tokens[i + 1].text, "(")) { ++i; continue; }
+                /* Collect argument tokens by splitting at top-level commas. The
+                   opening paren has already been consumed; depth=1 inside it. */
+                int depth = 1;
+                size_t start = i + 2;
+                size_t j;
+                for (j = start; j < ntokens; ++j) {
+                    if (!strcmp(tokens[j].text, "(")) ++depth;
+                    else if (!strcmp(tokens[j].text, ")")) { --depth; if (!depth) break; }
+                    else if (!strcmp(tokens[j].text, ",") && depth == 1) ++nargs;
+                }
+                if (j == ntokens) fatal("%s:%d: macro argument list is not closed",
+                                        tokens[i].file, tokens[i].line);
+                nargs = nargs + 1;
+                /* Re-walk to capture each arg's token range. */
+                args = resize(NULL, (nargs ? nargs : 1) * sizeof(Token *));
+                args_len = resize(NULL, (nargs ? nargs : 1) * sizeof(size_t));
+                depth = 1;
+                int idx = 0;
+                size_t a = start;
+                for (j = start; j < ntokens; ++j) {
+                    if (!strcmp(tokens[j].text, "(")) { ++depth; continue; }
+                    if (!strcmp(tokens[j].text, ")")) { --depth; if (!depth) break; }
+                    if (!strcmp(tokens[j].text, ",") && depth == 1) {
+                        args[idx] = &tokens[a];
+                        args_len[idx] = (size_t)(j - a);
+                        ++idx;
+                        a = j + 1;
+                    }
+                }
+                args[idx] = &tokens[a];
+                args_len[idx] = (size_t)(j - a);
+                ++idx;
+                consumed = j - i + 1;
+                int expected = m->nparams + (m->variadic ? 1 : 0);
+                if (m->variadic) {
+                    if (idx < m->nparams)
+                        fatal("%s:%d: too few macro arguments", tokens[i].file, tokens[i].line);
+                } else if (idx != expected) {
+                    fatal("%s:%d: wrong number of macro arguments",
+                          tokens[i].file, tokens[i].line);
+                }
+            }
+            if (++expansions > 10000 || m->nbody > 100000 ||
+                ntokens - consumed > 100000 - m->nbody)
+                fatal("%s:%d: macro expansion limit exceeded", tokens[i].file, tokens[i].line);
+            /* Build the replacement token stream, substituting parameters and
+               handling #x stringification and __VA_ARGS__. */
+            size_t argument_tokens = 1;
+            for (int p = 0; p < nargs; ++p) argument_tokens += args_len[p];
+            if (m->nbody && argument_tokens > 100000 / m->nbody)
+                fatal("macro replacement exceeds token limit");
+            size_t replacement_capacity = m->nbody ? m->nbody * argument_tokens : 1;
+            Token *replacement = resize(NULL, replacement_capacity * sizeof(Token));
+            size_t rlen = 0;
+            int actual_args = nargs;
+            for (size_t j = 0; j < m->nbody; ++j) {
+                Token *t = &m->body[j];
+                /* #x stringification: # followed by a parameter token. */
+                if (!strcmp(t->text, "#") && j + 1 < m->nbody) {
+                    Token *nxt = &m->body[j + 1];
+                    int p = -1;
+                    if (!strcmp(nxt->text, "__VA_ARGS__")) {
+                        p = m->nparams; /* first variadic slice */
+                    } else {
+                        for (int pi = 0; pi < m->nparams; ++pi)
+                            if (!strcmp(nxt->text, m->params[pi])) { p = pi; break; }
+                    }
+                    if (p >= 0 && p < actual_args) {
+                        /* Build a string literal from the argument source range.
+                           Use [first.source, last.source + last.text_len) so
+                           whitespace between tokens is preserved. For
+                           __VA_ARGS__ the range spans every variadic slice,
+                           including the original commas. */
+                        const char *first = args[p][0].source;
+                        Token *last;
+                        if (!strcmp(nxt->text, "__VA_ARGS__") && m->variadic)
+                            last = &args[nargs - 1][args_len[nargs - 1] - 1];
+                        else
+                            last = &args[p][args_len[p] - 1];
+                        size_t src_len = strlen(last->text);
+                        const char *end = last->source + src_len;
+                        size_t total = 2; /* surrounding quotes */
+                        for (const char *r = first; r < end; ++r)
+                            total += (*r == '"' || *r == '\\') ? 2 : 1;
+                        char *lit = resize(NULL, total + 1);
+                        size_t pos = 0;
+                        lit[pos++] = '"';
+                        for (const char *r = first; r < end; ++r) {
+                            if (*r == '"' || *r == '\\') lit[pos++] = '\\';
+                            lit[pos++] = *r;
+                        }
+                        lit[pos++] = '"';
+                        lit[pos] = 0;
+                        replacement[rlen] = *nxt;
+                        replacement[rlen].text = lit;
+                        for (int word = 0; word < 2; ++word)
+                            replacement[rlen].hidden_macros[word] |= tokens[i].hidden_macros[word];
+                        replacement[rlen].hidden_macros[k / 64] |= UINT64_C(1) << (k % 64);
+                        ++rlen;
+                        ++j; /* skip the parameter token */
+                        continue;
+                    }
+                }
+                /* __VA_ARGS__ expands to every variadic slice, rejoining
+                   them with comma tokens so substitution preserves them. */
+                if (m->variadic && !strcmp(t->text, "__VA_ARGS__")) {
+                    for (int s = m->nparams; s < nargs; ++s) {
+                        if (s > m->nparams) {
+                            replacement[rlen] = *t; /* comma separator */
+                            replacement[rlen].text = copy(",", 1);
+                            for (int word = 0; word < 2; ++word)
+                                replacement[rlen].hidden_macros[word] |= tokens[i].hidden_macros[word];
+                            replacement[rlen].hidden_macros[k / 64] |= UINT64_C(1) << (k % 64);
+                            ++rlen;
+                        }
+                        for (size_t q = 0; q < args_len[s]; ++q) {
+                            replacement[rlen] = args[s][q];
+                            for (int word = 0; word < 2; ++word)
+                                replacement[rlen].hidden_macros[word] |= tokens[i].hidden_macros[word];
+                            replacement[rlen].hidden_macros[k / 64] |= UINT64_C(1) << (k % 64);
+                            ++rlen;
+                        }
+                    }
+                    continue;
+                }
+                /* Parameter substitution. */
+                int p = -1;
+                for (int pi = 0; pi < m->nparams; ++pi)
+                    if (!strcmp(t->text, m->params[pi])) { p = pi; break; }
+                if (p >= 0) {
+                    for (size_t q = 0; q < args_len[p]; ++q) {
+                        replacement[rlen] = args[p][q];
+                        for (int word = 0; word < 2; ++word)
+                            replacement[rlen].hidden_macros[word] |= tokens[i].hidden_macros[word];
+                        replacement[rlen].hidden_macros[k / 64] |= UINT64_C(1) << (k % 64);
+                        ++rlen;
+                    }
+                    continue;
+                }
+                /* Plain token: copy through. */
+                replacement[rlen] = *t;
+                for (int word = 0; word < 2; ++word)
+                    replacement[rlen].hidden_macros[word] |= tokens[i].hidden_macros[word];
+                replacement[rlen].hidden_macros[k / 64] |= UINT64_C(1) << (k % 64);
+                ++rlen;
+            }
+            /* Paste adjacent preprocessing tokens before rescanning the result. */
+            for (size_t q = 0; q < rlen; ++q) {
+                if (strcmp(replacement[q].text, "##")) continue;
+                if (!q || q + 1 == rlen) fatal("token paste requires two operands");
+                Token *left = &replacement[q - 1], *right = &replacement[q + 1];
+                size_t length = strlen(left->text) + strlen(right->text);
+                char *joined = resize(NULL, length + 1);
+                strcpy(joined, left->text);
+                strcpy(joined + strlen(left->text), right->text);
+                Token *saved = tokens;
+                size_t saved_count = ntokens, saved_capacity = capacity;
+                tokens = NULL; ntokens = 0; capacity = 0;
+                lex_source("<token paste>", joined, 1);
+                if (ntokens != 1) fatal("token paste must form one token");
+                free(tokens);
+                tokens = saved; ntokens = saved_count; capacity = saved_capacity;
+                left->text = joined;
+                left->source = joined;
+                for (int word = 0; word < 2; ++word)
+                    left->hidden_macros[word] |= right->hidden_macros[word];
+                for (size_t r = q; r + 2 < rlen; ++r) replacement[r] = replacement[r + 2];
+                rlen -= 2;
+                --q;
+            }
+            /* Stringification needs the source range; splice would invalidate source
+               pointers into the freed tokens array, so capture the text first. */
+            int needs_stringification = 0;
+            for (size_t q = 0; q < m->nbody; ++q)
+                if (!strcmp(m->body[q].text, "#")) needs_stringification = 1;
+            if (needs_stringification) {
+                for (int p = 0; p < nargs; ++p) {
+                    if (args[p] && args[p]->source) {
+                        Token *last = &args[p][args_len[p] - 1];
+                        size_t src_len = strlen(last->text);
+                        size_t total = (size_t)((last->source + src_len) - args[p]->source);
+                        char *buf = resize(NULL, total + 1);
+                        memcpy(buf, args[p]->source, total);
+                        buf[total] = 0;
+                        Token *tk = resize(NULL, args_len[p] * sizeof(Token));
+                        for (size_t q = 0; q < args_len[p]; ++q) {
+                            tk[q] = args[p][q];
+                            tk[q].text = copy(args[p][q].text, strlen(args[p][q].text));
+                            const char *orig_src = args[p][q].source;
+                            if (orig_src >= args[p]->source &&
+                                orig_src <= last->source + src_len) {
+                                tk[q].source = buf + (orig_src - args[p]->source);
+                            } else {
+                                tk[q].source = copy(orig_src, strlen(orig_src));
+                            }
+                        }
+                        args[p] = tk;
+                    }
+                }
+            }
+            splice_tokens(i, consumed, replacement, rlen);
+            free(replacement);
+            free(args);
+            free(args_len);
+            continue;
+        }
         int line = tokens[i].line;
         size_t end = i + 1;
-        while (end < ntokens && tokens[end].line == line) ++end;
+        while (end < ntokens && tokens[end].line == line &&
+               tokens[end].file == tokens[i].file && strcmp(tokens[end].text, "<eof>")) ++end;
         if (i + 1 >= end) fatal("%s:%d: incomplete preprocessor directive",
                                 tokens[i].file, line);
         const char *dir = tokens[i + 1].text;
+        if (!strcmp(dir, "ifdef") || !strcmp(dir, "ifndef")) {
+            if (i + 3 != end) fatal("malformed conditional directive");
+            if (depth == 128) fatal("preprocessor conditional nesting limit exceeded");
+            parent[depth] = active;
+            selected[depth] = macro_defined(tokens[i + 2].text);
+            if (!strcmp(dir, "ifndef")) selected[depth] = !selected[depth];
+            saw_else[depth] = 0;
+            conditional_file[depth] = tokens[i].file;
+            active = active && selected[depth];
+            ++depth;
+            splice_tokens(i, end - i, NULL, 0);
+            continue;
+        }
+        if (!strcmp(dir, "else") || !strcmp(dir, "endif")) {
+            if (!depth || conditional_file[depth - 1] != tokens[i].file)
+                fatal("unmatched preprocessor conditional directive");
+            if (i + 2 != end) fatal("unexpected tokens after conditional directive");
+            if (!strcmp(dir, "else")) {
+                if (saw_else[depth - 1]) fatal("duplicate #else");
+                saw_else[depth - 1] = 1;
+                active = parent[depth - 1] && !selected[depth - 1];
+            } else active = parent[--depth];
+            splice_tokens(i, end - i, NULL, 0);
+            continue;
+        }
+        if (!active) {
+            splice_tokens(i, end - i, NULL, 0);
+            continue;
+        }
+        if (!strcmp(dir, "undef")) {
+            if (i + 3 != end) fatal("malformed #undef");
+            for (size_t k = 0; k < nmacros; ++k)
+                if (!strcmp(macros[k].name, tokens[i + 2].text))
+                    macros[k].name = ""; /* Keep hide-set indices stable. */
+            splice_tokens(i, end - i, NULL, 0);
+            continue;
+        }
         if (!strcmp(dir, "include")) {
-            if (i + 4 > end || strcmp(tokens[i + 2].text, "<") ||
-                strcmp(tokens[end - 1].text, ">"))
+            if (++expansions > 10000)
+                fatal("%s:%d: include expansion limit exceeded", tokens[i].file, line);
+            int quoted = i + 3 == end && tokens[i + 2].text[0] == '"';
+            if (!quoted && (i + 4 > end || strcmp(tokens[i + 2].text, "<") ||
+                strcmp(tokens[end - 1].text, ">")))
                 fatal("%s:%d: malformed #include", tokens[i].file, line);
             size_t cap = 64, len = 0;
             char *name = resize(NULL, cap);
-            for (size_t j = i + 3; j + 1 < end; ++j) {
-                size_t need = strlen(tokens[j].text);
-                while (len + need + 1 > cap) { cap *= 2; name = resize(name, cap); }
-                memcpy(name + len, tokens[j].text, need);
-                len += need;
+            if (quoted) {
+                free(name);
+                len = strlen(tokens[i + 2].text) - 2;
+                name = copy(tokens[i + 2].text + 1, len);
+            } else {
+                for (size_t j = i + 3; j + 1 < end; ++j) {
+                    size_t need = strlen(tokens[j].text);
+                    while (len + need + 1 > cap) { cap *= 2; name = resize(name, cap); }
+                    memcpy(name + len, tokens[j].text, need);
+                    len += need;
+                }
+                name[len] = 0;
             }
-            name[len] = 0;
-            size_t size = strlen(include_dir) + strlen(name) + 2;
+            size_t prefix = 0;
+            if (quoted) {
+                for (const char *p = tokens[i].file; *p; ++p)
+                    if (*p == '/') prefix = (size_t)(p - tokens[i].file) + 1;
+            }
+            size_t size = strlen(include_dir) + strlen(tokens[i].file) + len + 3;
             char *header = resize(NULL, size);
-            snprintf(header, size, "%s/%s", include_dir, name);
+            FILE *probe = NULL;
+            if (quoted) {
+                memcpy(header, tokens[i].file, prefix);
+                strcpy(header + prefix, name);
+                probe = fopen(header, "r");
+            }
+            if (probe) fclose(probe);
+            else snprintf(header, size, "%s/%s", include_dir, name);
             free(name);
             Token *outer = tokens;
             size_t outer_n = ntokens, outer_cap = capacity, outer_pos = pos;
@@ -329,64 +688,90 @@ static void preprocess(void) {
             capacity = outer_cap;
             pos = outer_pos;
             splice_tokens(i, end - i, inner, inner_n);
+            free(inner);
             continue;
         }
         if (!strcmp(dir, "define")) {
             if (i + 3 > end) fatal("%s:%d: malformed #define", tokens[i].file, line);
             const char *name = tokens[i + 2].text;
-            int zero_arg = 0;
+            int nparams = 0, variadic = 0;
+            char *params[16];
             size_t first = i + 3;
             if (first < end && !strcmp(tokens[first].text, "(") &&
                 tokens[first].source == tokens[i + 2].source + strlen(name)) {
-                if (first + 1 >= end || strcmp(tokens[first + 1].text, ")"))
-                    fatal("%s:%d: macro parameters are not supported",
-                          tokens[i].file, line);
-                zero_arg = 1;
-                first = first + 2;
+                /* Function-like macro. Find the matching ')' on this line. */
+                size_t paren_open = first;
+                int depth = 0;
+                size_t j;
+                for (j = paren_open; j < end; ++j) {
+                    if (!strcmp(tokens[j].text, "(")) ++depth;
+                    else if (!strcmp(tokens[j].text, ")")) { --depth; if (!depth) break; }
+                }
+                if (j == end) fatal("%s:%d: malformed macro parameter list",
+                                    tokens[i].file, line);
+                size_t paren_close = j;
+                if (paren_close > paren_open + 1) {
+                    /* Parse parameters between ( and ). */
+                    size_t p = paren_open + 1;
+                    while (p < paren_close) {
+                        if (!strcmp(tokens[p].text, "...")) {
+                            if (variadic || p != paren_close - 1)
+                                fatal("%s:%d: ... must be the last parameter",
+                                      tokens[i].file, line);
+                            variadic = 1;
+                            ++p;
+                            if (p != paren_close)
+                                fatal("%s:%d: trailing tokens after ...",
+                                      tokens[i].file, line);
+                            break;
+                        }
+                        if (nparams == 16) fatal("%s:%d: too many macro parameters",
+                                                 tokens[i].file, line);
+                        if (!identifier(tokens[p].text))
+                            fatal("%s:%d: expected a macro parameter name",
+                                  tokens[i].file, line);
+                        params[nparams++] = copy(tokens[p].text, strlen(tokens[p].text));
+                        ++p;
+                        if (p < paren_close) {
+                            if (strcmp(tokens[p].text, ","))
+                                fatal("%s:%d: expected ',' between parameters",
+                                      tokens[i].file, line);
+                            ++p;
+                        }
+                    }
+                }
+                first = paren_close + 1;
             }
             if (nmacros == 128) fatal("%s:%d: too many macros", tokens[i].file, line);
             Macro *m = &macros[nmacros++];
             m->name = copy(name, strlen(name));
-            m->zero_arg = zero_arg;
+            m->nparams = nparams;
+            m->variadic = variadic;
+            m->function_like = (nparams || variadic) ||
+                (first > i + 3); /* ( was consumed above */
+            for (int k = 0; k < nparams; ++k) m->params[k] = params[k];
             m->nbody = end - first;
             m->body = m->nbody ? resize(NULL, m->nbody * sizeof(Token)) : NULL;
-            for (size_t j = 0; j < m->nbody; ++j) m->body[j] = tokens[first + j];
+            for (size_t j = 0; j < m->nbody; ++j) {
+                m->body[j] = tokens[first + j];
+                /* Copy text — the original tokens are freed by splice_tokens. */
+                m->body[j].text = copy(tokens[first + j].text,
+                                       strlen(tokens[first + j].text));
+            }
             splice_tokens(i, end - i, NULL, 0);
             continue;
         }
         fatal("%s:%d: unsupported preprocessor directive", tokens[i].file, line);
     }
-    for (int depth = 0; depth < 64; ++depth) {
-        int changed = 0;
-        for (size_t i = 0; i < ntokens; ) {
-            if (!identifier(tokens[i].text)) { ++i; continue; }
-            Macro *m = NULL;
-            for (size_t k = 0; k < nmacros; ++k)
-                if (!strcmp(macros[k].name, tokens[i].text)) { m = &macros[k]; break; }
-            if (!m) { ++i; continue; }
-            size_t consumed = 1;
-            if (m->zero_arg) {
-                if (i + 1 >= ntokens || strcmp(tokens[i + 1].text, "(")) { ++i; continue; }
-                int parens = 0;
-                size_t j = i + 1;
-                for (; j < ntokens; ++j) {
-                    if (!strcmp(tokens[j].text, "(")) ++parens;
-                    else if (!strcmp(tokens[j].text, ")")) { if (--parens == 0) break; }
-                }
-                if (j == ntokens) fatal("%s:%d: unterminated macro call",
-                                        tokens[i].file, tokens[i].line);
-                consumed = j + 1 - i;
-            }
-            splice_tokens(i, consumed, m->body, m->nbody);
-            changed = 1;
-        }
-        if (!changed) return;
-    }
-    fatal("%s:%d: macro expansion too deep", tokens[0].file, tokens[0].line);
+    if (depth) fatal("unterminated preprocessor conditional");
 }
 static Token *current(void) { return &tokens[pos]; }
 
 static void error(const char *message) {
+    fprintf(stderr, "[DBG] error at pos=%zu file=%s line=%d\n", pos,
+            current()->file, current()->line);
+    for (size_t q = pos > 4 ? pos - 4 : 0; q < pos + 6 && q < ntokens; ++q)
+        fprintf(stderr, "[DBG]   tok[%zu] line=%d '%s'\n", q, tokens[q].line, tokens[q].text);
     fatal("%s:%d: %s (got '%s')", current()->file, current()->line,
           message, current()->text);
 }
@@ -423,6 +808,8 @@ static int identifier(const char *s) {
 
 static char *name(void) {
     if (!identifier(current()->text)) error("expected an identifier");
+    if (!compiling_softfloat && !strncmp(current()->text, "__4c_", 5))
+        error("identifier prefix __4c_ is reserved for compiler routines");
     return tokens[pos++].text;
 }
 
@@ -433,6 +820,10 @@ static Type *derived(TypeKind kind, Type *base, int size) {
 }
 static Type *pointer(Type *base) { return derived(TY_PTR, base, 8); }
 static int same_type(Type *a, Type *b) {
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    /* Record identity belongs to its declaration, not its byte layout. */
+    if (a->kind == TY_STRUCT || a->kind == TY_UNION) return 0;
     return a->kind == b->kind && a->size == b->size &&
            (!a->base || same_type(a->base, b->base));
 }
@@ -464,7 +855,7 @@ static void layout_record(Type *t, int is_union) {
         if (m->type->size > max_size) max_size = m->type->size;
     }
     t->align = max_align ? max_align : 1;
-    t->size = is_union ? max_size : (offset + t->align - 1) & ~(t->align - 1);
+    t->size = ((is_union ? max_size : offset) + t->align - 1) & ~(t->align - 1);
 }
 static int integer(Type *t) {
     switch (t->kind) {
@@ -475,7 +866,17 @@ static int integer(Type *t) {
 }
 /* Values of wide types live in x registers; narrower ones in w registers. */
 static int wide(Type *t) {
-    return t->kind == TY_PTR || t->kind == TY_LONG || t->kind == TY_ULONG;
+    return t->kind == TY_PTR || t->kind == TY_LONG || t->kind == TY_ULONG || t->kind == TY_DOUBLE;
+}
+static int aggregate(Type *t) {
+    return t->kind == TY_STRUCT || t->kind == TY_UNION;
+}
+/* How many GP registers an aggregate argument consumes under AAPCS64:
+   1 (size <= 8), 2 (size <= 16), or 0 (larger: copied to the stack). */
+static int aggregate_slots(Type *t) {
+    if (t->size <= 8) return 1;
+    if (t->size <= 16) return 2;
+    return 0;
 }
 static int unsigned_type(Type *t) {
     return t->kind == TY_UINT || t->kind == TY_ULONG ||
@@ -495,26 +896,27 @@ static Type *promote(Type *t) {
 typedef struct { uint64_t value; Type *type; } IntConst;
 static IntConst int_literal(void) {
     const char *s = current()->text;
-    if (!isdigit((unsigned char)*s) || (s[0] == '0' && isdigit((unsigned char)s[1])))
+    if (!isdigit((unsigned char)*s))
+        error("expected an integer literal");
+    int is_hex = s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+    if (s[0] == '0' && !is_hex && isdigit((unsigned char)s[1]))
         error("expected a decimal integer from 0 to 2147483647");
     int is_long = 0, is_unsigned = 0;
-    for (const char *p = s; *p; ++p) {
-        if (isdigit((unsigned char)*p)) continue;
-        if (*p == 'L' || *p == 'l') {
-            if (is_long) error("duplicate integer suffix");
-            is_long = 1;
-        } else if (*p == 'U' || *p == 'u') {
-            if (is_unsigned) error("duplicate integer suffix");
-            is_unsigned = 1;
-        } else {
-            error("expected a decimal integer from 0 to 2147483647");
-        }
+    for (const char *p = s + (is_hex ? 2 : 0); *p; ++p) {
+        if (is_hex ? isxdigit((unsigned char)*p) : isdigit((unsigned char)*p)) continue;
+        if (*p == 'L' || *p == 'l') is_long = 1;
+        else if (*p == 'U' || *p == 'u') is_unsigned = 1;
+        else error("expected an integer literal");
     }
     errno = 0;
     char *end;
-    unsigned long long n = strtoull(s, &end, 10);
-    if (end != s + strspn(s, "0123456789") || errno)
-        error("expected a decimal integer from 0 to 2147483647");
+    unsigned long long n = strtoull(is_hex ? s + 2 : s, &end, is_hex ? 16 : 10);
+    if (errno) error("integer literal is out of range");
+    const char *digits = is_hex ? s + 2 : s;
+    size_t dlen = (size_t)(end - digits);
+    if (is_hex ? !dlen || strspn(digits, "0123456789abcdefABCDEF") != dlen
+               : strspn(digits, "0123456789") != dlen)
+        error("expected an integer literal");
     if (!is_long && !is_unsigned && n > INT32_MAX)
         error("expected a decimal integer from 0 to 2147483647");
     if (is_long && !is_unsigned && n > INT64_MAX)
@@ -525,6 +927,44 @@ static IntConst int_literal(void) {
     Type *t = is_long ? (is_unsigned ? &ulong_type : &long_type)
                       : (is_unsigned ? &uint_type : &int_type);
     return (IntConst){n, t};
+}
+
+static int floating_literal(void) {
+    const char *s = current()->text;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) return 0;
+    if (strpbrk(s, "uUlL")) return 0;
+    return (isdigit((unsigned char)*s) || *s == '.') &&
+           (strchr(s, '.') || strchr(s, 'e') || strchr(s, 'E'));
+}
+
+static uint64_t double_bits(double value) {
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+/* The compiler never changes the process's initial C locale or rounding mode.
+   strtod supplies correctly rounded binary64 literals, including subnormals. */
+static uint64_t double_literal(void) {
+    const char *s = current()->text, *p = s;
+    int digits = 0;
+    while (isdigit((unsigned char)*p)) { ++p; ++digits; }
+    if (*p == '.') { ++p; while (isdigit((unsigned char)*p)) { ++p; ++digits; } }
+    if (!digits) error("invalid decimal double literal");
+    if (*p == 'e' || *p == 'E') {
+        ++p;
+        if (*p == '+' || *p == '-') ++p;
+        if (!isdigit((unsigned char)*p)) error("invalid double exponent");
+        while (isdigit((unsigned char)*p)) ++p;
+    }
+    if (*p) error("invalid decimal double literal or unsupported suffix");
+    if (double_bits(1.0) != UINT64_C(0x3ff0000000000000))
+        fatal("unsupported host binary64 representation");
+    char *end;
+    uint64_t bits = double_bits(strtod(s, &end));
+    if (*end || bits >= UINT64_C(0x7ff0000000000000)) error("double literal overflows binary64");
+    ++pos;
+    return bits;
 }
 static int find_tag(const char *s) {
     for (size_t i = ntags; i > 0; --i)
@@ -562,7 +1002,14 @@ static int enum_value(void) {
     if (take("-")) negative = 1;
     else take("+");
     int value;
-    if (isdigit((unsigned char)*current()->text)) value = decimal();
+    if (current()->text[0] == '\'') {
+        /* Character constants work in case labels and enumerator values. */
+        String str = decode_literal();
+        if (str.length != 1) error("character literal must contain one byte");
+        value = (unsigned char)str.data[0];
+        if (macos && value >= 128) value -= 256;
+        free(str.data);
+    } else if (isdigit((unsigned char)*current()->text)) value = decimal();
     else if (identifier(current()->text) && enum_constant(current()->text, &value))
         ++pos;
     else error("expected an enumerator value");
@@ -661,14 +1108,27 @@ static Type *parse_specs(void) {
     else if (take("char")) t = &char_type;
     else if (take("void")) t = &void_type;
     else if (take("_Bool")) t = &bool_type;
+    else if (take("double")) {
+        if (macos) error("double support currently requires the Linux target");
+        t = &double_type;
+    }
     else if (take("long")) {
-        if (take("unsigned")) t = &ulong_type;
+        if (take("long")) {
+            if (take("unsigned")) t = &ulong_type;
+            else if (take("signed")) { t = &long_type; }
+            else t = &long_type;
+            take("int");
+        } else if (take("unsigned")) t = &ulong_type;
         else t = &long_type;
         take("int");
     } else if (take("unsigned")) {
-        if (take("long")) t = &ulong_type;
-        else t = &uint_type;
-        take("int");
+        if (take("char")) t = &char_type;
+        else if (take("long")) {
+            if (take("long")) t = &ulong_type;
+            else t = &ulong_type;
+            take("int");
+        }
+        else { t = &uint_type; take("int"); }
     } else if (take("enum")) t = enum_specifier();
     else if (take("struct")) t = struct_specifier(0);
     else if (take("union")) t = struct_specifier(1);
@@ -679,8 +1139,129 @@ static Type *parse_specs(void) {
 static Type *consume_stars(Type *t) {
     while (take("*")) {
         t = pointer(t);
+        while (take("const")) {} /* ignore trailing qualifier */
     }
     return t;
+}
+/* Constant-expression evaluator for _Static_assert. Supports integer
+   literals, sizeof(type), the comparison operators, &&, ||, !, unary +/-
+   and binary +/- on constants. Sufficient for the host binary64 check. */
+static int const_expr_primary(uint64_t *out) {
+    if (!strcmp(current()->text, "(")) {
+        ++pos;
+        int v = const_expr_or(out);
+        expect(")");
+        return v;
+    }
+    if (!strcmp(current()->text, "sizeof")) {
+        ++pos;
+        expect("(");
+        if (!type_start()) error("sizeof requires a type in parentheses");
+        Type *t = parse_abstract();
+        expect(")");
+        *out = (uint64_t)t->size;
+        return 1;
+    }
+    const char *s = current()->text;
+    if (!isdigit((unsigned char)*s))
+        error("expected a constant expression");
+    errno = 0;
+    char *end;
+    unsigned long long n = strtoull(s, &end, 0);
+    if (errno || end == s) error("expected a constant expression");
+    ++pos;
+    *out = n;
+    return 1;
+}
+static int const_expr_unary(uint64_t *out) {
+    if (take("!")) {
+        uint64_t v;
+        const_expr_unary(&v);
+        *out = !v;
+        return 1;
+    }
+    if (take("+")) return const_expr_unary(out);
+    if (take("-")) {
+        uint64_t v;
+        const_expr_unary(&v);
+        *out = -(uint64_t)v;
+        return 1;
+    }
+    return const_expr_primary(out);
+}
+static int const_expr_mul(uint64_t *out) {
+    const_expr_unary(out);
+    while (!strcmp(current()->text, "*") ||
+           !strcmp(current()->text, "/") ||
+           !strcmp(current()->text, "%")) {
+        const char *op = tokens[pos++].text;
+        uint64_t r;
+        const_expr_unary(&r);
+        if (!strcmp(op, "*")) *out *= r;
+        else if (!strcmp(op, "/")) *out /= r;
+        else *out %= r;
+    }
+    return 1;
+}
+static int const_expr_add(uint64_t *out) {
+    const_expr_mul(out);
+    while (!strcmp(current()->text, "+") ||
+           !strcmp(current()->text, "-")) {
+        const char *op = tokens[pos++].text;
+        uint64_t r;
+        const_expr_mul(&r);
+        if (!strcmp(op, "+")) *out += r;
+        else *out -= r;
+    }
+    return 1;
+}
+static int const_expr_rel(uint64_t *out) {
+    const_expr_add(out);
+    const char *t = current()->text;
+    if (!strcmp(t, "<") || !strcmp(t, "<=") ||
+        !strcmp(t, ">") || !strcmp(t, ">=")) {
+        ++pos;
+        uint64_t r;
+        const_expr_add(&r);
+        int lt = *out < r, eq = *out == r;
+        if (!strcmp(t, "<")) *out = lt;
+        else if (!strcmp(t, "<=")) *out = lt || eq;
+        else if (!strcmp(t, ">")) *out = !lt && !eq;
+        else *out = !lt;
+    }
+    return 1;
+}
+static int const_expr_eq(uint64_t *out) {
+    const_expr_rel(out);
+    const char *t = current()->text;
+    if (!strcmp(t, "==") || !strcmp(t, "!=")) {
+        ++pos;
+        uint64_t r;
+        const_expr_rel(&r);
+        int eq = *out == r;
+        *out = !strcmp(t, "==") ? eq : !eq;
+    }
+    return 1;
+}
+static int const_expr_and(uint64_t *out) {
+    const_expr_eq(out);
+    while (!strcmp(current()->text, "&&")) {
+        ++pos;
+        uint64_t r;
+        const_expr_eq(&r);
+        *out = (*out && r) ? 1 : 0;
+    }
+    return 1;
+}
+static int const_expr_or(uint64_t *out) {
+    const_expr_and(out);
+    while (!strcmp(current()->text, "||")) {
+        ++pos;
+        uint64_t r;
+        const_expr_and(&r);
+        *out = (*out || r) ? 1 : 0;
+    }
+    return 1;
 }
 static int decimal(void) {
     const char *s = current()->text;
@@ -736,6 +1317,7 @@ static Type *array_suffix(Type *t, int parameter, int global) {
 static Type *parse_declarator(Type *base, char **name_out, int parameter) {
     while (take("*")) {
         base = pointer(base);
+        while (take("const")) {} /* ignore */
     }
     char *s = NULL;
     if (identifier(current()->text)) s = tokens[pos++].text;
@@ -759,6 +1341,243 @@ static int allocate(Type *t) {
     if (frame_bytes > max_frame_bytes) max_frame_bytes = frame_bytes;
     return offset;
 }
+/* Parse a constant initializer for a global. Strings are registered with the
+   string table so they can be emitted in .rodata later. Returns the number
+   of InitEntry slots written. */
+static size_t parse_initializer(Type *t, InitEntry *out, size_t out_max);
+static size_t parse_one_initializer(Type *t, InitEntry *out, size_t out_max) {
+    (void)out_max;
+    if (!t) error("initializer for incomplete type");
+    /* String literal as a pointer. */
+    if (current()->text[0] == '"' && t->kind == TY_PTR) {
+        String str = string_bytes();
+        size_t idx = nstrings++;
+        strings = resize(strings, nstrings * sizeof(String));
+        strings[idx] = str;
+        out[0] = (InitEntry){(uint64_t)idx, t, 1};
+        return 1;
+    }
+    /* NULL pointer constant or (void*)0 / (char*)0. */
+    if (t->kind == TY_PTR) {
+        if (current()->text[0] == '(' && pos + 1 < ntokens &&
+            (!strcmp(tokens[pos + 1].text, "void") || !strcmp(tokens[pos + 1].text, "char"))) {
+            ++pos;
+            parse_abstract();
+            expect(")");
+            IntConst z = int_literal();
+            if (z.value != 0) error("global pointer initializer must be zero");
+            out[0] = (InitEntry){0, t, 0};
+            return 1;
+        }
+        if (!strcmp(current()->text, "NULL")) {
+            ++pos;
+            out[0] = (InitEntry){0, t, 0};
+            return 1;
+        }
+        IntConst z = int_literal();
+        if (z.value != 0) error("global pointer initializer must be zero");
+        out[0] = (InitEntry){0, t, 0};
+        return 1;
+    }
+    /* Unary +/- followed by an integer or floating literal. */
+    if (!strcmp(current()->text, "-")) {
+        ++pos;
+        if (floating_literal()) {
+            uint64_t v = double_literal();
+            out[0] = (InitEntry){v ^ UINT64_C(0x8000000000000000), &double_type, 0};
+        } else if (t->kind == TY_DOUBLE) {
+            IntConst c = int_literal();
+            double value;
+            if (c.type->kind == TY_INT) value = (double)(int32_t)c.value;
+            else if (c.type->kind == TY_UINT) value = (double)(uint32_t)c.value;
+            else if (c.type->kind == TY_LONG) value = (double)(int64_t)c.value;
+            else value = (double)c.value;
+            out[0] = (InitEntry){double_bits(-value), &double_type, 0};
+        } else {
+            IntConst c = int_literal();
+            uint64_t v = (uint64_t)(-(int64_t)c.value);
+            if (t->kind == TY_BOOL) v = v != 0;
+            out[0] = (InitEntry){v, c.type, 0};
+        }
+        return 1;
+    }
+    if (!strcmp(current()->text, "+")) {
+        ++pos;
+        if (floating_literal()) {
+            out[0] = (InitEntry){double_literal(), &double_type, 0};
+        } else if (t->kind == TY_DOUBLE) {
+            IntConst c = int_literal();
+            double value;
+            if (c.type->kind == TY_INT) value = (double)(int32_t)c.value;
+            else if (c.type->kind == TY_UINT) value = (double)(uint32_t)c.value;
+            else if (c.type->kind == TY_LONG) value = (double)(int64_t)c.value;
+            else value = (double)c.value;
+            out[0] = (InitEntry){double_bits(value), &double_type, 0};
+        } else {
+            IntConst c = int_literal();
+            out[0] = (InitEntry){c.value, c.type, 0};
+        }
+        return 1;
+    }
+    /* Cast: (type)literal. */
+    if (!strcmp(current()->text, "(")) {
+        ++pos;
+        expect("(");
+        Type *cast = parse_abstract();
+        expect(")");
+        IntConst c = int_literal();
+        out[0] = (InitEntry){c.value, cast, 0};
+        return 1;
+    }
+    if (current()->text[0] == '\'') {
+        String str = decode_literal();
+        if (str.length != 1) error("character literal must contain one byte");
+        uint64_t v = (uint8_t)str.data[0];
+        if (macos && v >= 128) v -= 256;
+        free(str.data);
+        out[0] = (InitEntry){v, &char_type, 0};
+        return 1;
+    }
+    if (isdigit((unsigned char)current()->text[0])) {
+        IntConst c = int_literal();
+        /* Choose a target type if t is unknown: prefer narrower. */
+        if (t->kind == TY_BOOL) {
+            out[0] = (InitEntry){c.value != 0, &int_type, 0};
+            return 1;
+        }
+        if (t->kind == TY_CHAR) {
+            out[0] = (InitEntry){c.value & 0xFF, &char_type, 0};
+            return 1;
+        }
+        out[0] = (InitEntry){c.value, c.type, 0};
+        return 1;
+    }
+    /* Enum constant or zero identifier. */
+    if (!strcmp(current()->text, "0") || !strcmp(current()->text, "0L") ||
+        !strcmp(current()->text, "0UL")) {
+        IntConst c = int_literal();
+        out[0] = (InitEntry){0, c.type, 0};
+        return 1;
+    }
+    if (isalpha((unsigned char)current()->text[0]) || current()->text[0] == '_') {
+        int value;
+        if (enum_constant(current()->text, &value)) {
+            ++pos;
+            out[0] = (InitEntry){(uint64_t)(int32_t)value, &int_type, 0};
+            return 1;
+        }
+        if (!strcmp(current()->text, "NULL") && t->kind == TY_PTR) {
+            ++pos;
+            out[0] = (InitEntry){0, t, 0};
+            return 1;
+        }
+        if (!strcmp(current()->text, "true") || !strcmp(current()->text, "false")) {
+            int v = !strcmp(current()->text, "true");
+            ++pos;
+            out[0] = (InitEntry){v, &bool_type, 0};
+            return 1;
+        }
+        error("expected a constant initializer");
+        return 0;
+    }
+    error("expected a constant initializer");
+    return 0;
+}
+static size_t parse_initializer(Type *t, InitEntry *out, size_t out_max) {
+    size_t pos = 0;
+    if (t->kind == TY_STRUCT || t->kind == TY_UNION) {
+        for (int m = 0; m < t->nmembers; ++m) {
+            if (m > 0) {
+                if (!take(",")) break;
+            }
+            if (pos >= out_max) error("initializer is too large");
+            if (!strcmp(current()->text, "{")) {
+                ++pos;
+                pos += parse_initializer(t->members[m].type, out + pos, out_max - pos);
+                if (!take("}")) error("expected '}' at end of initializer");
+            } else {
+                pos += parse_one_initializer(t->members[m].type, out + pos, out_max - pos);
+            }
+            if (t->kind == TY_UNION && m == 0) {
+                /* Union: only first member's data is meaningful; the type's
+                   full size is allocated. Other members are zero-padding. */
+                while (pos * 8 < (size_t)t->size) {
+                    out[pos++] = (InitEntry){0, &int_type, 0};
+                }
+            }
+        }
+        take(",");
+    } else if (t->kind == TY_ARRAY) {
+        if (t->base->kind == TY_CHAR && current()->text[0] == '"') {
+            String str = string_bytes();
+            size_t to_copy = str.length;
+            if (to_copy > (size_t)t->size) to_copy = t->size;
+            for (size_t i = 0; i < to_copy; ++i) {
+                out[pos++] = (InitEntry){(uint8_t)str.data[i], &char_type, 0};
+            }
+            while (pos < (size_t)(t->size / (t->base->size ? t->base->size : 1))) {
+                out[pos++] = (InitEntry){0, &char_type, 0};
+            }
+            return pos;
+        }
+        int base_size = t->base->size ? t->base->size : 1;
+        int nelems = t->size / base_size;
+        int count = 0;
+        int inferred = (nelems == 0);
+        if (strcmp(current()->text, "}")) {
+            for (;;) {
+                if (!inferred && count >= nelems) error("too many array initializers");
+                if (!strcmp(current()->text, "{")) {
+                    ++pos;
+                    pos += parse_initializer(t->base, out + pos, out_max - pos);
+                    if (!take("}")) error("expected '}' at end of initializer");
+                } else {
+                    pos += parse_one_initializer(t->base, out + pos, out_max - pos);
+                }
+                ++count;
+                if (!take(",")) break;
+                if (!strcmp(current()->text, "}")) break;
+            }
+        }
+        if (inferred) nelems = count;
+        while (count < nelems) {
+            out[pos++] = (InitEntry){0, t->base, 0};
+            ++count;
+        }
+        if (inferred) t->size = nelems * base_size;
+    } else {
+        /* Scalar initializer (or single-element brace).
+           `{value}` around a scalar is equivalent to `value`. */
+        if (!strcmp(current()->text, "{")) {
+            ++pos;
+            pos += parse_one_initializer(t, out + pos, out_max - pos);
+            if (!take("}")) error("expected '}' at end of initializer");
+        } else {
+            pos += parse_one_initializer(t, out + pos, out_max - pos);
+        }
+    }
+    return pos;
+}
+/* Emit one initializer entry. */
+static void emit_init_entry(InitEntry e) {
+    Type *t = e.type;
+    if (!t) t = &int_type;
+    if (t->kind == TY_PTR || t->kind == TY_LONG || t->kind == TY_ULONG ||
+        t->kind == TY_DOUBLE) {
+        if (e.is_string) {
+            fprintf(program, "    .quad Lstr%llu\n", (unsigned long long)e.value);
+        } else {
+            fprintf(program, "    .quad %llu\n", (unsigned long long)e.value);
+        }
+    } else if (t->kind == TY_INT || t->kind == TY_UINT || t->kind == TY_BOOL) {
+        fprintf(program, "    .word %llu\n",
+                (unsigned long long)(int32_t)e.value);
+    } else if (t->kind == TY_CHAR) {
+        fprintf(program, "    .byte %llu\n", (unsigned long long)(e.value & 0xFF));
+    } else {
+        fprintf(program, "    .word %llu\n", (unsigned long long)e.value);
+    }
+}
 
 static int find_local(const char *s) {
     for (size_t i = nlocals; i > 0; --i)
@@ -773,6 +1592,7 @@ static int find_function(const char *s) {
 }
 
 static void emit(const char *fmt, ...) {
+    if (suppress_emit) return;
     va_list ap;
     va_start(ap, fmt);
     int written = vfprintf(body, fmt, ap);
@@ -786,7 +1606,7 @@ static void emit(const char *fmt, ...) {
 static void source_comment(FILE *out, size_t first, size_t last) {
     const char *p = tokens[first].source;
     const char *end = tokens[last].source + strlen(tokens[last].text);
-    fprintf(out, "    // C line %d: ", tokens[first].line);
+    fprintf(out, "    //\n    // C line %d: ", tokens[first].line);
     int space = 0;
     for (; p < end; ++p) {
         if (isspace((unsigned char)*p)) { space = 1; continue; }
@@ -794,7 +1614,7 @@ static void source_comment(FILE *out, size_t first, size_t last) {
         space = 0;
         fputc((unsigned char)*p, out);
     }
-    fputc('\n', out);
+    fputs("\n    //\n", out);
 }
 
 static void pool(uint32_t value) {
@@ -828,6 +1648,7 @@ static void literal64_to(const char *xreg, uint64_t value) {
 }
 
 static Expr expression(void);
+static Expr assignment_expr(void);
 static Expr unary(void);
 /* Load a value from the address held in the given register into w9/x9. */
 static void load_value_reg(Type *t, const char *addr) {
@@ -848,7 +1669,7 @@ static Expr value(Expr e) {
     } else if (e.type->kind == TY_STRUCT || e.type->kind == TY_UNION) {
         /* Aggregates decay to their address; no register load. */
     } else if (e.lvalue) {
-        if (e.local >= 0 && !locals[e.local].initialized)
+        if (!suppress_emit && e.local >= 0 && !locals[e.local].initialized)
             error("unknown local value in self-initializer");
         if (wide(e.type)) emit("    ldr x0, [x0]\n");
         else if (e.type->kind == TY_INT || e.type->kind == TY_UINT)
@@ -865,6 +1686,11 @@ static Expr value(Expr e) {
     e.local = -1;
     return e;
 }
+static Expr condition_value(Expr e) {
+    e = value(e);
+    if (e.type->kind == TY_DOUBLE) emit("    add x0, x0, x0\n");
+    return e;
+}
 static void narrow_char(void) {
     emit("    sub sp, sp, #16\n    strb w0, [sp]\n    ldrb w0, [sp]\n    add sp, sp, #16\n");
     if (macos) {
@@ -875,6 +1701,7 @@ static void narrow_char(void) {
 /* Normalize any scalar value in x0/w0 to exactly 0 or 1 for _Bool. */
 static void normalize_bool(Type *from) {
     size_t id = next_label++;
+    if (from->kind == TY_DOUBLE) emit("    add x0, x0, x0\n"); /* Ignore zero's sign. */
     emit(wide(from) ? "    cbz x0, .Lbool%zu\n" : "    cbz w0, .Lbool%zu\n", id);
     literal_reg("w0", 1);
     emit("    cbz xzr, .Lbool_end%zu\n.Lbool%zu:\n", id, id);
@@ -888,6 +1715,15 @@ static void extend_reg(Type *src, const char *wreg, const char *xreg) {
 static Expr convert(Expr e, Type *to) {
     e = value(e);
     if (to->kind == TY_VOID) error("cannot convert to void");
+    if (to->kind == TY_DOUBLE) {
+        if (e.type->kind != TY_DOUBLE) {
+            if (!integer(e.type)) error("double conversion requires an integer or double");
+            if (!wide(e.type)) extend_reg(e.type, "w0", "x0");
+            need_softfloat = 1;
+            emit("    bl .L__4c_sf_%s64\n", unsigned_type(e.type) ? "u" : "i");
+        }
+        return (Expr){to, 0, -1, 0};
+    }
     if (to->kind == TY_PTR) {
         int compatible = same_type(e.type, to) || (integer(e.type) && e.zero);
         if (!compatible && e.type->kind == TY_PTR &&
@@ -903,11 +1739,12 @@ static Expr convert(Expr e, Type *to) {
     if (e.type->kind == TY_STRUCT || e.type->kind == TY_UNION)
         error("cannot convert aggregate to a scalar");
     if (to->kind == TY_BOOL) {
-        if (!integer(e.type) && e.type->kind != TY_PTR)
+        if (!integer(e.type) && e.type->kind != TY_PTR && e.type->kind != TY_DOUBLE)
             error("cannot convert to _Bool");
         if (e.type->kind != TY_BOOL) normalize_bool(e.type);
         return (Expr){to, 0, -1, e.zero};
     }
+    if (e.type->kind == TY_DOUBLE) error("double-to-integer conversion is not supported yet");
     if (!integer(e.type)) error("cannot convert pointer to integer");
     if (to->kind == TY_CHAR) narrow_char();
     else if (to->kind == TY_LONG || to->kind == TY_ULONG) {
@@ -1006,22 +1843,322 @@ static Expr string_literal(void) {
     ++nstrings;
     return (Expr){derived(TY_ARRAY, &char_type, (int)str.length + 1), 1, -1, 0};
 }
+/* Helper: parse a brace-wrapped initializer and store its single value into
+   the given frame address. Used for nested scalar-in-braces initializers. */
+static void parse_compound_inner(Type *t, const char *addr) {
+    Expr e = expression();
+    convert(e, t);
+    if (wide(t)) emit("    str x0, [%s]\n", addr);
+    else if (t->kind == TY_INT || t->kind == TY_UINT || t->kind == TY_BOOL)
+        emit("    str w0, [%s]\n", addr);
+    else if (t->kind == TY_CHAR)
+        emit("    strb w0, [%s]\n", addr);
+    else emit("    str x0, [%s]\n", addr);
+}
 static Expr primary(void) {
+    /* va_start(ap, last), va_end(ap), va_copy(dest, src) are syntactic forms
+       with compiler-known semantics on AAPCS64. They consume the token
+       stream and emit code (or no code) at the use site. */
+    if (!strcmp(current()->text, "va_start")) {
+        ++pos;
+        expect("(");
+        if (!identifier(current()->text)) error("expected a va_list identifier");
+        char *ap_name = tokens[pos].text;
+        int ap_local = find_local(ap_name);
+        if (ap_local < 0) error("va_start first argument must be a local variable");
+        ++pos;
+        expect(",");
+        if (!identifier(current()->text)) error("expected a parameter name");
+        ++pos;
+        expect(")");
+        Function *fn = &functions[current_function];
+        int tag_off = fn->va_tag_offset;
+        int frame = (max_frame_bytes + 15) & ~15;
+        int save_end = fn->va_save_offset + 64;
+        /* ap = &tag = x29 + tag_off */
+        emit("    add x9, x29, #%d\n", tag_off);
+        emit("    str x9, [x29, #%d]\n", locals[ap_local].offset);
+        emit("    ldr x9, [x29, #%d]\n", locals[ap_local].offset);
+        /* tag->stack = x29 + frame (caller's overflow area) */
+        emit("    add x10, x29, #%d\n", frame);
+        emit("    str x10, [x9]\n");
+        /* tag->gr_top = x29 + save_end (just past x7's slot) */
+        emit("    add x10, x29, #%d\n", save_end);
+        emit("    str x10, [x9, #8]\n");
+        /* tag->vr_top = x29 + fp_save_end (just past d7's 16-byte slot) */
+        int fp_end = fn->fp_save_offset + 128;
+        emit("    add x10, x29, #%d\n", fp_end);
+        emit("    str x10, [x9, #16]\n");
+        /* tag->gr_offset = -8 * (8 - named GP regs), increasing per va_arg. */
+        int gr_off_val = 8 * fn->nparams - 64;
+        /* sub with an immediate cannot name xzr as its first operand. */
+        emit("    sub x10, x10, x10\n");
+        if (gr_off_val < 0)
+            emit("    sub x10, x10, #%d\n", -gr_off_val);
+        else
+            emit("    add x10, x10, #%d\n", gr_off_val);
+        emit("    str w10, [x9, #24]\n");
+        /* tag->vr_offset = -128 (all eight FP slots available) */
+        emit("    sub x10, x10, x10\n");
+        emit("    sub x10, x10, #128\n");
+        emit("    str w10, [x9, #28]\n");
+        return (Expr){&void_type, 0, -1, 1};
+    }
+    if (!strcmp(current()->text, "va_end")) {
+        ++pos;
+        expect("(");
+        if (!identifier(current()->text)) error("expected a va_list identifier");
+        ++pos;
+        expect(")");
+        /* va_end is a no-op on AAPCS64 */
+        return (Expr){&void_type, 0, -1, 1};
+    }
+    if (!strcmp(current()->text, "va_copy")) {
+        ++pos;
+        expect("(");
+        if (!identifier(current()->text)) error("expected a va_list identifier");
+        char *dst_name = tokens[pos].text;
+        int dst_local = find_local(dst_name);
+        if (dst_local < 0) error("va_copy destination must be a local variable");
+        ++pos;
+        expect(",");
+        if (!identifier(current()->text)) error("expected a va_list identifier");
+        char *src_name = tokens[pos].text;
+        int src_local = find_local(src_name);
+        if (src_local < 0) error("va_copy source must be a local variable");
+        ++pos;
+        expect(")");
+        /* *dst = *src — copy the 40-byte __va_list_tag */
+        emit("    add x9, x29, #%d\n", locals[src_local].offset);
+        emit("    ldr x10, [x9]\n");
+        emit("    add x9, x29, #%d\n", locals[dst_local].offset);
+        emit("    str x10, [x9]\n");
+        emit("    add x9, x29, #%d\n", locals[src_local].offset);
+        emit("    ldr x10, [x9, #8]\n");
+        emit("    add x9, x29, #%d\n", locals[dst_local].offset);
+        emit("    str x10, [x9, #8]\n");
+        emit("    add x9, x29, #%d\n", locals[src_local].offset);
+        emit("    ldr w10, [x9, #24]\n");
+        emit("    add x9, x29, #%d\n", locals[dst_local].offset);
+        emit("    str w10, [x9, #24]\n");
+        return (Expr){&void_type, 0, -1, 1};
+    }
     if (!strcmp(current()->text, "sizeof")) {
         ++pos;
         expect("(");
-        if (!type_start()) error("sizeof requires a type in parentheses");
-        Type *t = parse_abstract();
+        if (type_start()) {
+            /* sizeof(type) — the type may be followed by '*' (pointer) or
+               directly by ')'. parse_abstract handles both. */
+            Type *t = parse_abstract();
+            expect(")");
+            /* ldr w0 zero-extends into x0, matching size_t semantics. */
+            literal((uint32_t)t->size);
+            return (Expr){&ulong_type, 0, -1, t->size == 0};
+        }
+        /* sizeof does not evaluate its operand (VLAs are not supported). */
+        int saved_suppress = suppress_emit, saved_frame = frame_bytes;
+        int saved_max = max_frame_bytes, saved_softfloat = need_softfloat;
+        size_t saved_constants = nconstants;
+        suppress_emit = 1;
+        Expr e = expression();
+        suppress_emit = saved_suppress;
+        frame_bytes = saved_frame;
+        max_frame_bytes = saved_max;
+        need_softfloat = saved_softfloat;
+        nconstants = saved_constants;
         expect(")");
-        /* ldr w0 zero-extends into x0, matching size_t semantics. */
-        literal((uint32_t)t->size);
-        return (Expr){&ulong_type, 0, -1, t->size == 0};
+        literal((uint32_t)e.type->size);
+        return (Expr){&ulong_type, 0, -1, e.type->size == 0};
     }
     if (take("(")) {
         if (type_start()) {
             Type *to = parse_abstract();
             expect(")");
-            return convert(unary(), to);
+            /* Compound literal: (Type){...} — allocate the object on the
+               stack, initialize its fields from arbitrary expressions, and
+               return its address as an lvalue. */
+            if (!strcmp(current()->text, "{")) {
+                ++pos;
+                int align = alignment(to);
+                int offset = (frame_bytes + align - 1) & ~(align - 1);
+                frame_bytes = offset + to->size;
+                if (frame_bytes > 4080) error("locals exceed the 4080-byte frame limit");
+                if (frame_bytes > max_frame_bytes) max_frame_bytes = frame_bytes;
+                /* Initialize each member positionally. */
+                if (to->kind == TY_STRUCT || to->kind == TY_UNION) {
+                    int initialized_member[32] = {0};
+                    for (int m = 0; m < to->nmembers; ++m) {
+                        if (m > 0) {
+                            if (!take(",")) break;
+                        }
+                        int moff = offset + to->members[m].offset;
+                        int msize = to->members[m].type->size;
+                        /* Designator: '.name' selects that member. Members
+                           with no initializer remain zero (handled below). */
+                        if (!strcmp(current()->text, ".")) {
+                            ++pos;
+                            char *dname = tokens[pos].text;
+                            ++pos;
+                            int found = -1;
+                            for (int q = 0; q < to->nmembers; ++q)
+                                if (!strcmp(to->members[q].name, dname)) { found = q; break; }
+                            if (found < 0) error("unknown member in designated initializer");
+                            expect("=");
+                            m = found;
+                            moff = offset + to->members[m].offset;
+                        }
+                        initialized_member[m] = 1;
+                        if (to->kind == TY_UNION && m > 0 && strcmp(current()->text, ".")) {
+                            /* Skip past unused union members. */
+                            while (m < to->nmembers &&
+                                   !strcmp(current()->text, ",")) {
+                                ++pos;
+                                ++m;
+                            }
+                            break;
+                        }
+                        if (to->members[m].type->kind == TY_ARRAY &&
+                            !strcmp(current()->text, "{")) {
+                            /* Array member initialized with brace list. */
+                            ++pos;
+                            Type *bt = to->members[m].type->base;
+                            int bsize = bt->size ? bt->size : 1;
+                            int nelems = to->members[m].type->size / bsize;
+                            int idx = 0;
+                            while (idx < nelems &&
+                                   strcmp(current()->text, "}")) {
+                                char inner_addr[32];
+                                snprintf(inner_addr, sizeof(inner_addr),
+                                         "x29, #%d", moff + idx * bsize);
+                                if (bt->kind == TY_CHAR &&
+                                    current()->text[0] == '"') {
+                                    String str = string_bytes();
+                                    int to_copy = str.length;
+                                    if (to_copy > nelems - idx)
+                                        to_copy = nelems - idx;
+                                    for (int q = 0; q < to_copy; ++q) {
+                                        emit("    sub x10, x10, x10\n");
+                                        emit("    add w10, w10, #%d\n", (unsigned char)str.data[q]);
+                                        snprintf(inner_addr + 9,
+                                                 sizeof(inner_addr) - 9,
+                                                 "%d", moff + idx * bsize + q);
+                                        emit("    strb w10, [x29, #%d]\n",
+                                             moff + idx * bsize + q);
+                                    }
+                                    idx += to_copy;
+                                } else {
+                                    assignment_expr();
+                                    if (wide(bt)) emit("    str x0, [%s]\n", inner_addr);
+                                    else if (bt->kind == TY_INT || bt->kind == TY_UINT || bt->kind == TY_BOOL)
+                                        emit("    str w0, [%s]\n", inner_addr);
+                                    else if (bt->kind == TY_CHAR)
+                                        emit("    strb w0, [%s]\n", inner_addr);
+                                    ++idx;
+                                }
+                                if (!take(",")) break;
+                            }
+                            if (!take("}")) error("expected '}' at end of array initializer");
+                            (void)msize;
+                            continue;  /* Don't fall into scalar parse. */
+                        } else if (!strcmp(current()->text, "{")) {
+                            /* Nested aggregate or brace-wrapped scalar. */
+                            ++pos;
+                            char inner_addr[32];
+                            snprintf(inner_addr, sizeof(inner_addr),
+                                     "x29, #%d", moff);
+                            parse_compound_inner(to->members[m].type, inner_addr);
+                            if (!take("}")) error("expected '}' at end of initializer");
+                            continue;
+                        } else {
+                            Expr e = assignment_expr();
+                            convert(e, to->members[m].type);
+                            char inner_addr[32];
+                            snprintf(inner_addr, sizeof(inner_addr),
+                                     "x29, #%d", moff);
+                            if (to->members[m].type->kind == TY_PTR ||
+                                to->members[m].type->kind == TY_LONG ||
+                                to->members[m].type->kind == TY_ULONG) {
+                                emit("    str x0, [%s]\n", inner_addr);
+                            } else if (to->members[m].type->kind == TY_INT ||
+                                       to->members[m].type->kind == TY_UINT ||
+                                       to->members[m].type->kind == TY_BOOL) {
+                                emit("    str w0, [%s]\n", inner_addr);
+                            } else if (to->members[m].type->kind == TY_CHAR) {
+                                emit("    strb w0, [%s]\n", inner_addr);
+                            } else if (to->members[m].type->kind == TY_ARRAY) {
+                                error("nested array compound literals are not supported");
+                            } else {
+                                emit("    str x0, [%s]\n", inner_addr);
+                            }
+                            (void)msize;
+                        }
+                    }
+                    /* Zero-fill members the initializer did not mention. */
+                    for (int m = 0; m < to->nmembers; ++m)
+                        if (!initialized_member[m]) {
+                            Type *mt = to->members[m].type;
+                            int words = (mt->size + 7) / 8;
+                            for (int w = 0; w < words; ++w) {
+                                emit("    sub x0, x0, x0\n");
+                                emit("    add x9, x29, #%d\n",
+                                     offset + to->members[m].offset + w * 8);
+                                int rem = mt->size - w * 8;
+                                if (rem >= 8) emit("    str x0, [x9]\n");
+                                else
+                                    for (int b = 0; b < rem; ++b)
+                                        emit("    add x9, x29, #%d\n    strb w0, [x9]\n",
+                                             offset + to->members[m].offset + w * 8 + b);
+                            }
+                        }
+                    take(",");
+                } else if (to->kind == TY_ARRAY) {
+                    /* Array compound literal: positional elements. */
+                    int base_size = to->base->size;
+                    int count = 0;
+                    if (strcmp(current()->text, "}")) {
+                        for (;;) {
+                            int idx = count * base_size;
+                            int moff = offset + idx;
+                            assignment_expr();
+                            char inner_addr[32];
+                            snprintf(inner_addr, sizeof(inner_addr),
+                                     "x29, #%d", moff);
+                            if (to->base->kind == TY_PTR || to->base->kind == TY_LONG || to->base->kind == TY_ULONG)
+                                emit("    str x0, [%s]\n", inner_addr);
+                            else if (to->base->kind == TY_INT || to->base->kind == TY_UINT || to->base->kind == TY_BOOL)
+                                emit("    str w0, [%s]\n", inner_addr);
+                            else if (to->base->kind == TY_CHAR)
+                                emit("    strb w0, [%s]\n", inner_addr);
+                            ++count;
+                            if (!take(",")) break;
+                            if (!strcmp(current()->text, "}")) break;
+                        }
+                    }
+                } else {
+                    /* Scalar compound literal. */
+                    Expr e = assignment_expr();
+                    convert(e, to);
+                    char inner_addr[32];
+                    snprintf(inner_addr, sizeof(inner_addr), "x29, #%d", offset);
+                    if (wide(to)) emit("    str x0, [%s]\n", inner_addr);
+                    else if (to->kind == TY_INT || to->kind == TY_UINT ||
+                             to->kind == TY_BOOL)
+                        emit("    str w0, [%s]\n", inner_addr);
+                    else if (to->kind == TY_CHAR)
+                        emit("    strb w0, [%s]\n", inner_addr);
+                }
+                if (!take("}")) error("expected '}' at end of compound literal");
+                /* Place the compound literal's address in x0 so the value()/
+                   store_value() path that follows in assignment can copy from it. */
+                emit("    add x0, x29, #%d\n", offset);
+                return (Expr){to, 1, -1, 0};  /* lvalue pointing at offset */
+            }
+            Expr operand = unary();
+            if (to->kind == TY_VOID) {
+                if (operand.type->kind != TY_VOID) value(operand);
+                return (Expr){&void_type, 0, -1, 0};
+            }
+            return convert(operand, to);
         }
         Expr e = expression();
         expect(")");
@@ -1036,6 +2173,11 @@ static Expr primary(void) {
         free(str.data);
         literal((uint32_t)n);
         return (Expr){&int_type, 0, -1, n == 0};
+    }
+    if (floating_literal()) {
+        if (macos) error("double support currently requires the Linux target");
+        literal64(double_literal());
+        return (Expr){&double_type, 0, -1, 0};
     }
     if (isdigit((unsigned char)*current()->text)) {
         IntConst c = int_literal();
@@ -1066,28 +2208,83 @@ static Expr primary(void) {
         if (function < 0) error("call to an undeclared function");
         Function *fn = &functions[function];
         int expected = fn->nparams;
-        /* Variadic calls always stage the full eight-register area. */
-        int stage = fn->variadic ? 8 : expected;
         ++pos; expect("(");
-        if (stage) emit("    sub sp, sp, #%d\n", stage * 16);
+        /* A function returning an aggregate larger than sixteen bytes
+           receives the caller's result buffer address in x8. Reserve the
+           frame slot for that buffer now. */
+        int result_off = -1;
+        if (aggregate(fn->result)) {
+            int align = alignment(fn->result);
+            result_off = (frame_bytes + align - 1) & ~(align - 1);
+            frame_bytes = result_off + fn->result->size;
+            if (frame_bytes > 4080) error("locals exceed the 4080-byte frame limit");
+            if (frame_bytes > max_frame_bytes) max_frame_bytes = frame_bytes;
+        }
+        /* Classify arguments before staging: register arguments occupy one or
+           two GP registers (or one FP register for doubles); aggregates
+           larger than sixteen bytes are copied to the stack overflow area.
+           The classification is static because non-variadic arguments are
+           converted to the prototype's parameter types. Variadic calls stage
+           the full eight-register area; every unnamed slot is a scalar. */
+        int slot_of[8];
+        int stack_offsets[8];
+        int reg_count = 0, running_stack = 0, gp_total = 0;
+        for (int i = 0; i < expected; ++i) {
+            Type *pt = fn->params[i];
+            if (pt->kind == TY_DOUBLE) { slot_of[i] = reg_count++; continue; }
+            if (aggregate(pt)) {
+                int s = aggregate_slots(pt);
+                if (s > 0 && gp_total + s <= 8) {
+                    slot_of[i] = reg_count++; gp_total += s;
+                } else {
+                    slot_of[i] = -1;
+                    stack_offsets[i] = running_stack;
+                    running_stack += (pt->size + 7) & ~7;
+                }
+            } else { slot_of[i] = reg_count++; ++gp_total; }
+        }
+        int stack_bytes = (running_stack + 15) & ~15;
+        if (running_stack > 4095)
+            error("aggregate arguments exceed the staging area");
+        /* Unnamed variadic slots stage sequentially in the full area. */
+        if (fn->variadic)
+            for (int i = expected; i < 8; ++i) slot_of[i] = i;
+        int stage = fn->variadic ? 8 : reg_count;
+        if (stage || stack_bytes)
+            emit("    sub sp, sp, #%d\n", stage * 16 + stack_bytes);
         Type *arg_types[8] = {0};
         int count = 0;
         if (!take(")")) {
             for (;;) {
                 if (count == 8) error("at most eight function arguments");
                 if (count < expected) {
-                    convert(expression(), fn->params[count]);
+                    Type *pt = fn->params[count];
+                    convert(assignment_expr(), pt);
+                    if (slot_of[count] >= 0) {
+                        /* Stash the value, or the aggregate's address. */
+                        emit("    str x0, [sp, #%d]\n", slot_of[count] * 16);
+                    } else {
+                        /* Copy the aggregate into the overflow area. */
+                        emit("    add x9, sp, #%d\n", stage * 16 + stack_offsets[count]);
+                        int words = (pt->size + 7) / 8;
+                        for (int w = 0; w < words; ++w) {
+                            emit("    ldr x12, [x0, #%d]\n", w * 8);
+                            emit("    str x12, [x9, #%d]\n", w * 8);
+                        }
+                    }
                 } else {
                     if (!fn->variadic)
                         error("wrong number of function arguments");
                     /* Default argument promotions for variadic slots. */
-                    Expr a = value(expression());
+                    Expr a = value(assignment_expr());
                     if (a.type->kind == TY_CHAR) narrow_char();
                     else if (a.type->kind == TY_STRUCT || a.type->kind == TY_UNION)
                         error("aggregate arguments are not supported yet");
                     arg_types[count] = promote(a.type);
+                    /* Unnamed slots stage sequentially in the full area. */
+                    emit("    str x0, [sp, #%d]\n", count * 16);
                 }
-                emit("    str x0, [sp, #%d]\n", count++ * 16);
+                ++count;
                 if (!take(",")) break;
             }
             expect(")");
@@ -1097,14 +2294,45 @@ static Expr primary(void) {
         } else if (count != expected) {
             error("wrong number of function arguments");
         }
-        for (int i = 0; i < count; ++i)
-            emit("    ldr %s%d, [sp, #%d]\n",
-                 wide(i < expected ? fn->params[i] : arg_types[i]) ? "x" : "w", i, i * 16);
+        int gp = 0, fp = 0;
+        for (int i = 0; i < count; ++i) {
+            Type *type = i < expected ? fn->params[i] : arg_types[i];
+            if (i < expected && slot_of[i] < 0) continue; /* stack argument */
+            if (type->kind == TY_DOUBLE) {
+                emit("    ldr d%d, [sp, #%d]\n", fp++, slot_of[i] * 16);
+            } else if (aggregate(type)) {
+                int s = aggregate_slots(type);
+                emit("    ldr x9, [sp, #%d]\n", slot_of[i] * 16);
+                emit("    ldr x%d, [x9]\n", gp);
+                if (s == 2) emit("    ldr x%d, [x9, #8]\n", gp + 1);
+                gp += s;
+            } else {
+                emit("    ldr %s%d, [sp, #%d]\n",
+                     wide(type) ? "x" : "w", gp++, slot_of[i] * 16);
+            }
+        }
         if (stage) emit("    add sp, sp, #%d\n", stage * 16);
-        emit("    bl %s%s\n", macos ? "_" : "", s);
+        if (aggregate(fn->result) && fn->result->size > 16)
+            emit("    add x8, x29, #%d\n", result_off);
+        emit("    bl %s%s\n", fn->internal ? ".L" : macos ? "_" : "", s);
+        if (stack_bytes) emit("    add sp, sp, #%d\n", stack_bytes);
+        if (aggregate(fn->result)) {
+            if (fn->result->size <= 16) {
+                emit("    str x0, [x29, #%d]\n", result_off);
+                if (fn->result->size > 8)
+                    emit("    str x1, [x29, #%d]\n", result_off + 8);
+            }
+            emit("    add x0, x29, #%d\n", result_off);
+        } else if (fn->result->kind == TY_DOUBLE)
+            emit("    sub sp, sp, #16\n    str d0, [sp]\n    ldr x0, [sp]\n    add sp, sp, #16\n");
         if (fn->result->kind == TY_CHAR) narrow_char();
         else if (fn->result->kind == TY_BOOL) normalize_bool(&int_type);
         return (Expr){fn->result, 0, -1, 0};
+    }
+    if (local >= 0 && locals[local].offset == -4) {
+        global = locals[local].value;
+        s = globals[global].name;
+        local = -1;
     }
     if (local < 0) {
         if (global < 0) error("unknown local or global variable");
@@ -1137,7 +2365,19 @@ static void scale_index(int size, Type *index) {
         if (size & 1) emit("    add x10, x10, x0, lsl #%d\n", bit);
     emit("    sub x0, x10, xzr\n");
 }
+static void emit_divide(Type *t, int remainder);
 static Expr binary_add(Expr left, Expr right, int subtract) {
+    if (subtract && left.type->kind == TY_PTR && right.type->kind == TY_PTR) {
+        if (!same_type(left.type, right.type) || !left.type->base->size)
+            error("pointer subtraction requires compatible complete object types");
+        emit("    sub x9, x9, x0\n");
+        if (left.type->base->size == 1) emit("    sub x0, x9, xzr\n");
+        else {
+            literal64_to("x0", (uint64_t)left.type->base->size);
+            emit_divide(&long_type, 0);
+        }
+        return (Expr){&long_type, 0, -1, 0};
+    }
     if (left.type->kind == TY_PTR && integer(right.type)) {
         if (!left.type->base->size) error("pointer arithmetic requires a complete object type");
         scale_index(left.type->base->size, right.type);
@@ -1165,13 +2405,30 @@ static Expr postfix(void) {
         if (take("[")) {
             e = value(e);
             emit("    sub sp, sp, #16\n    str x0, [sp]\n");
-            Expr index = value(expression());
+            Expr index = value(assignment_expr());
             expect("]");
             emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
             if (!(e.type->kind == TY_PTR || index.type->kind == TY_PTR))
                 error("indexing requires a pointer or array");
             e = binary_add(e, index, 0);
             e = (Expr){e.type->base, 1, -1, 0};
+            continue;
+        }
+        int increment = take("++");
+        if (increment || take("--")) {
+            if (!e.lvalue || e.type->kind == TY_ARRAY || e.type->kind == TY_DOUBLE ||
+                (!integer(e.type) && e.type->kind != TY_PTR))
+                error("postfix increment requires an assignable integer or pointer");
+            emit("    sub sp, sp, #16\n    str x0, [sp]\n");
+            Expr old = value(e);
+            emit("    str x0, [sp, #8]\n    sub x9, x0, xzr\n");
+            literal(1);
+            Expr updated = binary_add(old, (Expr){&int_type, 0, -1, 0}, !increment);
+            convert(updated, e.type);
+            emit("    ldr x11, [sp]\n");
+            store_value(e.type, "x11");
+            emit("    ldr x0, [sp, #8]\n    add sp, sp, #16\n");
+            e = (Expr){e.type, 0, -1, 0};
             continue;
         }
         int arrow = take("->");
@@ -1208,8 +2465,17 @@ static Expr unary(void) {
         if (!e.type->base->size) error("dereference requires a complete object type");
         return (Expr){e.type->base, 1, -1, 0};
     }
+    if (take("~")) {
+        Expr e = value(unary());
+        if (!integer(e.type)) error("bitwise complement requires an integer");
+        Type *t = promote(e.type);
+        const char *r = wide(t) ? "x" : "w";
+        emit("    sub %s0, %szr, %s0\n    sub %s0, %s0, #1\n", r, r, r, r, r);
+        return (Expr){t, 0, -1, 0};
+    }
     if (take("!")) {
         Expr e = value(unary());
+        if (e.type->kind == TY_DOUBLE) emit("    add x0, x0, x0\n");
         if (wide(e.type)) {
             emit("    sub x9, x0, xzr\n    sub x0, x0, x0\n");
             comparison(&ulong_type, "==");
@@ -1222,6 +2488,13 @@ static Expr unary(void) {
     int plus = take("+");
     if (plus || take("-")) {
         Expr e = value(unary());
+        if (e.type->kind == TY_DOUBLE) {
+            if (!plus) {
+                literal64_to("x11", UINT64_C(0x8000000000000000));
+                emit("    add x0, x0, x11\n");
+            }
+            return e;
+        }
         if (!integer(e.type)) error("unary arithmetic requires an integer");
         Type *t = promote(e.type);
         if (!plus) emit(wide(t) ? "    sub x0, xzr, x0\n" : "    sub w0, wzr, w0\n");
@@ -1232,6 +2505,7 @@ static Expr unary(void) {
         Expr e = unary();
         if (!e.lvalue || e.type->kind == TY_ARRAY)
             error("increment and decrement require an assignable object");
+        if (e.type->kind == TY_DOUBLE) error("double increment is not supported yet");
         emit("    sub sp, sp, #16\n    str x0, [sp]\n");
         emit("    ldr x9, [sp]\n");
         load_value_reg(e.type, "x9");
@@ -1266,48 +2540,49 @@ static void emit_multiply(Type *t) {
     }
     emit("    sub x0, x11, xzr\n");
 }
-/* Divide the left operand (w9) by the right operand (w0) truncating
-   toward zero, at 32-bit width only; 64-bit division is unsupported.
-   Operands are zero-extended so the restoring loop runs on clean
-   unsigned patterns; signedness is tracked in x13/x14 flags and the
-   quotient is negated once per negative operand. */
-static void emit_divide(Type *t) {
+/* Restoring unsigned division consumes one dividend bit per step. Compare
+   the top bits before subtracting so unsigned 64-bit values work too.
+   Signed operands use unsigned magnitudes; remainder follows the dividend. */
+static void emit_divide(Type *t, int remainder) {
     size_t id = next_label++;
-    if (wide(t)) fatal("64-bit division is not supported yet");
-    emit("    sub x13, x13, x13\n    add x9, x13, w9, uxtw\n");
-    emit("    sub x13, x13, x13\n    add x0, x13, w0, uxtw\n");
-    if (t->kind == TY_INT) {
-        emit("    sub x13, x13, x13\n");
-        emit("    tbz w9, #31, .Ldsa%zu\n", id);
-        emit("    add x13, x13, #1\n    sub w9, wzr, w9\n");
+    int bits = wide(t) ? 64 : 32;
+    const char *r = wide(t) ? "x" : "w";
+    if (!wide(t)) {
+        emit("    sub x13, x13, x13\n    add x9, x13, w9, uxtw\n");
+        emit("    add x0, x13, w0, uxtw\n");
+    }
+    if (!unsigned_type(t)) {
+        emit("    sub x13, x13, x13\n    sub x14, x14, x14\n");
+        emit("    tbz %s9, #%d, .Ldsa%zu\n", r, bits - 1, id);
+        emit("    add x13, x13, #1\n    sub %s9, %szr, %s9\n", r, r, r);
         emit(".Ldsa%zu:\n", id);
-        emit("    sub x14, x14, x14\n");
-        emit("    tbz w0, #31, .Ldsb%zu\n", id);
-        emit("    add x14, x14, #1\n    sub w0, wzr, w0\n");
+        emit("    tbz %s0, #%d, .Ldsb%zu\n", r, bits - 1, id);
+        emit("    add x14, x14, #1\n    sub %s0, %szr, %s0\n", r, r, r);
         emit(".Ldsb%zu:\n", id);
     }
     emit("    sub x10, x10, x10\n    sub x11, x11, x11\n");
-    for (int i = 31; i >= 0; --i) {
+    for (int i = bits - 1; i >= 0; --i) {
         emit("    add x10, x10, x10\n");
-        emit("    tbz w9, #%d, .Ldva%zu_%d\n", i, id, i);
-        emit("    add x10, x10, #1\n");
-        emit(".Ldva%zu_%d:\n", id, i);
+        emit("    tbz %s9, #%d, .Ldva%zu_%d\n", r, i, id, i);
+        emit("    add x10, x10, #1\n.Ldva%zu_%d:\n", id, i);
+        emit("    tbz x10, #63, .Ldvl%zu_%d\n", id, i);
+        emit("    tbz x0, #63, .Ldvt%zu_%d\n", id, i);
+        emit("    cbz xzr, .Ldvc%zu_%d\n.Ldvl%zu_%d:\n", id, i, id, i);
+        emit("    tbz x0, #63, .Ldvc%zu_%d\n", id, i);
+        emit("    cbz xzr, .Ldvn%zu_%d\n.Ldvc%zu_%d:\n", id, i, id, i);
         emit("    sub x12, x10, x0\n");
         emit("    tbz x12, #63, .Ldvt%zu_%d\n", id, i);
         emit("    cbz xzr, .Ldvn%zu_%d\n", id, i);
         emit(".Ldvt%zu_%d:\n    sub x10, x10, x0\n", id, i);
-        if (i < 12) {
-            emit("    add x11, x11, #%d\n", 1 << i);
-        } else {
-            literal_reg("w12", 1u << i);
-            emit("    add x11, x11, w12, uxtw\n");
-        }
+        emit("    sub x12, x12, x12\n    add x12, x12, #1\n");
+        emit("    add x11, x11, x12, lsl #%d\n", i);
         emit(".Ldvn%zu_%d:\n", id, i);
     }
-    emit("    sub w0, w11, wzr\n");
-    if (t->kind == TY_INT) {
-        emit("    tbz x13, #0, .Ldvs%zu\n    sub w0, wzr, w0\n.Ldvs%zu:\n", id, id);
-        emit("    tbz x14, #0, .Ldvo%zu\n    sub w0, wzr, w0\n.Ldvo%zu:\n", id, id);
+    emit("    sub %s0, %s%d, %szr\n", r, r, remainder ? 10 : 11, r);
+    if (!unsigned_type(t)) {
+        emit("    tbz x13, #0, .Ldvs%zu\n    sub %s0, %szr, %s0\n.Ldvs%zu:\n", id, r, r, r, id);
+        if (!remainder)
+            emit("    tbz x14, #0, .Ldvo%zu\n    sub %s0, %szr, %s0\n.Ldvo%zu:\n", id, r, r, r, id);
     }
 }
 /* Multiplication and division bind more tightly than addition. */
@@ -1315,22 +2590,36 @@ static Expr multiplicative(void) {
     Expr e = unary();
     for (;;) {
         int star = take("*");
-        if (!star && !take("/")) break;
+        int divide = !star && take("/");
+        int remainder = !star && !divide && take("%");
+        if (!star && !divide && !remainder) break;
         e = value(e);
         emit("    sub sp, sp, #16\n    str x0, [sp]\n");
         Expr right = value(unary());
+        if (e.type->kind == TY_DOUBLE || right.type->kind == TY_DOUBLE) {
+            if (remainder) error("remainder requires integers");
+            convert(right, &double_type);
+            emit("    ldr x9, [sp]\n    str x0, [sp]\n    sub x0, x9, xzr\n");
+            convert(e, &double_type);
+            emit("    ldr x1, [sp]\n    add sp, sp, #16\n");
+            literal_reg("w2", !star);
+            need_softfloat = 1;
+            emit("    bl .L__4c_sf_binary\n");
+            e = (Expr){&double_type, 0, -1, 0};
+            continue;
+        }
         emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
         if (!integer(e.type) || !integer(right.type))
             error("multiplication and division require integers");
         Type *t = common_integer(e.type, right.type);
+        if (wide(t)) {
+            if (!wide(e.type)) extend_reg(e.type, "w9", "x9");
+            if (!wide(right.type)) extend_reg(right.type, "w0", "x0");
+        }
         if (star) {
-            if (!wide(t)) {
-                extend_reg(e.type, "w9", "x9");
-                extend_reg(right.type, "w0", "x0");
-            }
             emit_multiply(t);
         } else {
-            emit_divide(t);
+            emit_divide(t, remainder);
         }
         e = (Expr){t, 0, -1, 0};
     }
@@ -1345,6 +2634,47 @@ static Expr additive(void) {
         Expr right = value(multiplicative());
         emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
         e = binary_add(e, right, subtract);
+    }
+    return e;
+}
+
+/* Shift repeatedly by one bit. ADD doubles for left shift; right shift
+   rebuilds the bit pattern using TBZ and shifted ADD, preserving a signed
+   operand's top bit. Counts outside [0,width) are undefined C. */
+static Expr shift_value(Expr left, Expr right, int to_right) {
+    if (!integer(left.type) || !integer(right.type)) error("shift requires integers");
+    Type *t = promote(left.type);
+    const char *r = wide(t) ? "x" : "w";
+    int bits = wide(t) ? 64 : 32;
+    size_t id = next_label++;
+    emit("    sub w14, w0, wzr\n.Lshift%zu:\n", id);
+    emit("    cbz w14, .Lshift%zu_end\n", id);
+    if (!to_right) emit("    add %s9, %s9, %s9\n", r, r, r);
+    else {
+        emit("    sub x11, x11, x11\n    sub x12, x12, x12\n    add x12, x12, #1\n");
+        for (int i = 1; i < bits; ++i) {
+            emit("    tbz %s9, #%d, .Lshift%zu_bit%d\n", r, i, id, i);
+            emit("    add %s11, %s11, %s12, lsl #%d\n.Lshift%zu_bit%d:\n", r, r, r, i - 1, id, i);
+        }
+        if (!unsigned_type(t)) {
+            emit("    tbz %s9, #%d, .Lshift%zu_sign\n", r, bits - 1, id);
+            emit("    add %s11, %s11, %s12, lsl #%d\n.Lshift%zu_sign:\n", r, r, r, bits - 1, id);
+        }
+        emit("    sub %s9, %s11, %szr\n", r, r, r);
+    }
+    emit("    sub w14, w14, #1\n    cbz xzr, .Lshift%zu\n.Lshift%zu_end:\n", id, id);
+    emit("    sub %s0, %s9, %szr\n", r, r, r);
+    return (Expr){t, 0, -1, 0};
+}
+static Expr shift(void) {
+    Expr e = additive();
+    while (!strcmp(current()->text, "<<") || !strcmp(current()->text, ">>")) {
+        int rightward = take(">>"); if (!rightward) expect("<<");
+        e = value(e);
+        emit("    sub sp, sp, #16\n    str x0, [sp]\n");
+        Expr right = value(additive());
+        emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
+        e = shift_value(e, right, rightward);
     }
     return e;
 }
@@ -1397,12 +2727,27 @@ static void comparison(Type *t, const char *op) {
 }
 
 static void typed_comparison(Expr a, Expr b, const char *op) {
+    if (a.type->kind == TY_DOUBLE || b.type->kind == TY_DOUBLE)
+        error("double comparisons are not supported yet");
     if (integer(a.type) && integer(b.type)) {
-        comparison(common_integer(a.type, b.type), op);
+        Type *t = common_integer(a.type, b.type);
+        if (wide(t)) {
+            if (!wide(a.type)) extend_reg(a.type, "w9", "x9");
+            if (!wide(b.type)) extend_reg(b.type, "w0", "x0");
+        }
+        comparison(t, op);
         return;
     }
-    if (strcmp(op, "==") && strcmp(op, "!=")) error("pointer ordering is not supported yet");
-    if (!((a.type->kind == TY_PTR && same_type(a.type, b.type)) ||
+    if (strcmp(op, "==") && strcmp(op, "!=")) {
+        if (a.type->kind != TY_PTR || b.type->kind != TY_PTR ||
+            !same_type(a.type, b.type) || a.type->base->kind == TY_VOID)
+            error("pointer ordering requires compatible object pointers");
+        comparison(&ulong_type, op);
+        return;
+    }
+    if (!((a.type->kind == TY_PTR && b.type->kind == TY_PTR &&
+           (same_type(a.type, b.type) || a.type->base->kind == TY_VOID ||
+            b.type->base->kind == TY_VOID)) ||
           (a.type->kind == TY_PTR && integer(b.type) && b.zero) ||
           (b.type->kind == TY_PTR && integer(a.type) && a.zero)))
         error("incompatible pointer comparison");
@@ -1414,13 +2759,13 @@ static void typed_comparison(Expr a, Expr b, const char *op) {
     emit("    sub w0, w0, w0\n    add w0, w0, #%d\n.Lpend%zu:\n", equal, id);
 }
 static Expr relational(void) {
-    Expr e = additive();
+    Expr e = shift();
     while (!strcmp(current()->text, "<") || !strcmp(current()->text, "<=") ||
            !strcmp(current()->text, ">") || !strcmp(current()->text, ">=")) {
         const char *op = tokens[pos++].text;
         e = value(e);
         emit("    sub sp, sp, #16\n    str x0, [sp]\n");
-        Expr right = value(additive());
+        Expr right = value(shift());
         emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
         typed_comparison(e, right, op);
         e = (Expr){&int_type, 0, -1, 0};
@@ -1440,17 +2785,70 @@ static Expr equality(void) {
     }
     return e;
 }
+/* Construct AND/XOR one bit at a time; shifted ADD sets a bit known clear. */
+static Expr bit_combine(Expr left, Expr right, int exclusive) {
+    if (!integer(left.type) || !integer(right.type)) error("bitwise operation requires integers");
+    Type *t = common_integer(left.type, right.type);
+    const char *r = wide(t) ? "x" : "w";
+    if (wide(t)) {
+        if (!wide(left.type)) extend_reg(left.type, "w9", "x9");
+        if (!wide(right.type)) extend_reg(right.type, "w0", "x0");
+    }
+    size_t id = next_label++;
+    emit("    sub x11, x11, x11\n    sub x12, x12, x12\n    add x12, x12, #1\n");
+    for (int bit = 0; bit < (wide(t) ? 64 : 32); ++bit) {
+        if (exclusive == 2) {
+            emit("    tbz %s9, #%d, .Lbit%zu_leftzero%d\n", r, bit, id, bit);
+            emit("    cbz xzr, .Lbit%zu_set%d\n.Lbit%zu_leftzero%d:\n", id, bit, id, bit);
+            emit("    tbz %s0, #%d, .Lbit%zu_end%d\n", r, bit, id, bit);
+        } else if (exclusive) {
+            emit("    tbz %s9, #%d, .Lbit%zu_leftzero%d\n", r, bit, id, bit);
+            emit("    tbz %s0, #%d, .Lbit%zu_set%d\n", r, bit, id, bit);
+            emit("    cbz xzr, .Lbit%zu_end%d\n.Lbit%zu_leftzero%d:\n", id, bit, id, bit);
+            emit("    tbz %s0, #%d, .Lbit%zu_end%d\n", r, bit, id, bit);
+        } else {
+            emit("    tbz %s9, #%d, .Lbit%zu_end%d\n", r, bit, id, bit);
+            emit("    tbz %s0, #%d, .Lbit%zu_end%d\n", r, bit, id, bit);
+        }
+        emit(".Lbit%zu_set%d:\n    add %s11, %s11, %s12, lsl #%d\n", id, bit, r, r, r, bit);
+        emit(".Lbit%zu_end%d:\n", id, bit);
+    }
+    emit("    sub %s0, %s11, %szr\n", r, r, r);
+    return (Expr){t, 0, -1, 0};
+}
+static Expr bit_and(void) {
+    Expr e = equality();
+    while (take("&")) {
+        e = value(e);
+        emit("    sub sp, sp, #16\n    str x0, [sp]\n");
+        Expr right = value(equality());
+        emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
+        e = bit_combine(e, right, 0);
+    }
+    return e;
+}
+static Expr bit_xor(void) {
+    Expr e = bit_and();
+    while (take("^")) {
+        e = value(e);
+        emit("    sub sp, sp, #16\n    str x0, [sp]\n");
+        Expr right = value(bit_and());
+        emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
+        e = bit_combine(e, right, 1);
+    }
+    return e;
+}
 /* Bitwise OR: result bit i is set when either operand's bit i is set.
    Starting from the left operand's pattern, each right-operand bit is
    tested with TBZ; if it is set and the left bit is clear, the result
    gains that bit through an immediate or literal-pool ADD. */
 static Expr bit_or(void) {
-    Expr e = equality();
+    Expr e = bit_xor();
     while (take("|")) {
         size_t id = next_label++;
         e = value(e);
         emit("    sub sp, sp, #16\n    str x0, [sp]\n");
-        Expr right = value(equality());
+        Expr right = value(bit_xor());
         emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
         if (!integer(e.type) || !integer(right.type))
             error("bitwise or requires integers");
@@ -1461,6 +2859,9 @@ static Expr bit_or(void) {
         if (!wide(t)) {
             /* Normalize the low 32 bits; upper bits must be zero. */
             emit("    sub x10, x10, x10\n    add x9, x10, w9, uxtw\n");
+        } else {
+            if (!wide(e.type)) extend_reg(e.type, "w9", "x9");
+            if (!wide(right.type)) extend_reg(right.type, "w0", "x0");
         }
         for (int i = 0; i < bits; ++i) {
             emit("    tbz %s, #%d, .Lbor%zu_e%d\n", b, i, id, i);
@@ -1468,7 +2869,10 @@ static Expr bit_or(void) {
             emit("    cbz xzr, .Lbor%zu_e%d\n", id, i);
             emit(".Lbor%zu_%d:\n", id, i);
             if (i < 12) emit("    add %s, %s, #%d\n", a, a, 1 << i);
-            else {
+            else if (wide(t)) {
+                literal64_to("x11", UINT64_C(1) << i);
+                emit("    add %s, %s, x11\n", a, a);
+            } else {
                 literal_reg("w10", 1u << i);
                 emit("    add %s, %s, w10\n", a, a);
             }
@@ -1486,7 +2890,7 @@ static Expr logical_and(void) {
     Expr e = bit_or();
     while (take("&&")) {
         size_t id = next_label++;
-        e = value(e);
+        e = condition_value(e);
         emit(wide(e.type) ? "    cbz x0, .Land%zu\n" : "    cbz w0, .Land%zu\n", id);
         Expr right = value(bit_or());
         normalize_bool(right.type);
@@ -1501,7 +2905,7 @@ static Expr logical_or(void) {
     Expr e = logical_and();
     while (take("||")) {
         size_t id = next_label++;
-        e = value(e);
+        e = condition_value(e);
         emit(wide(e.type) ? "    cbz x0, .Lor%zu\n" : "    cbz w0, .Lor%zu\n", id);
         literal_reg("w0", 1);
         emit("    cbz xzr, .Lor%zu_end\n.Lor%zu:\n", id, id);
@@ -1512,32 +2916,95 @@ static Expr logical_or(void) {
     }
     return e;
 }
-static Expr expression(void) {
+/* Delay each arm's conversion until both types are known. Only the selected
+   arm executes; its value reaches its own conversion block in x0. */
+static Expr conditional(void) {
     Expr e = logical_or();
+    if (!take("?")) return e;
+    size_t id = next_label++;
+    e = condition_value(e);
+    emit("    cbz %s0, .Lcond%zu_false\n", wide(e.type) ? "x" : "w", id);
+    Expr yes = expression();
+    if (yes.type->kind != TY_VOID) yes = value(yes);
+    expect(":");
+    emit("    cbz xzr, .Lcond%zu_true_convert\n.Lcond%zu_false:\n", id, id);
+    Expr no = conditional();
+    if (no.type->kind != TY_VOID) no = value(no);
+    Type *t = NULL;
+    if (integer(yes.type) && integer(no.type)) t = common_integer(yes.type, no.type);
+    else if ((integer(yes.type) || yes.type->kind == TY_DOUBLE) &&
+             (integer(no.type) || no.type->kind == TY_DOUBLE)) t = &double_type;
+    else if (same_type(yes.type, no.type)) t = yes.type;
+    else if (yes.type->kind == TY_PTR && integer(no.type) && no.zero) t = yes.type;
+    else if (no.type->kind == TY_PTR && integer(yes.type) && yes.zero) t = no.type;
+    else if (yes.type->kind == TY_PTR && no.type->kind == TY_PTR &&
+             (yes.type->base->kind == TY_VOID || no.type->base->kind == TY_VOID))
+        t = pointer(&void_type);
+    else error("incompatible conditional operands");
+    if (t->kind != TY_VOID) convert(no, t);
+    emit("    cbz xzr, .Lcond%zu_end\n.Lcond%zu_true_convert:\n", id, id);
+    if (t->kind != TY_VOID) convert(yes, t);
+    emit(".Lcond%zu_end:\n", id);
+    return (Expr){t, 0, -1, 0};
+}
+/* Assignment expression: conditional expressions joined by '=' and compound
+   assignment operators. Call arguments and subscripts stop at this level so
+   that a ',' separates them instead of forming a comma expression. */
+static Expr assignment_expr(void) {
+    Expr e = conditional();
     if (take("=")) {
         if (!e.lvalue || e.type->kind == TY_ARRAY)
             error("assignment requires a local variable or dereferenced object on the left");
         emit("    sub sp, sp, #16\n    str x0, [sp]\n");
-        Expr right = convert(expression(), e.type);
+        Expr right = convert(assignment_expr(), e.type);
         emit("    ldr x9, [sp]\n    add sp, sp, #16\n");
         store_value(e.type, "x9");
         right.zero = 0; /* An assignment is not an integer constant expression. */
         return right;
     }
-    int pluseq = take("+=");
-    if (pluseq || take("-=")) {
+    const char *op = current()->text;
+    if (!strcmp(op, "+=") || !strcmp(op, "-=") || !strcmp(op, "*=") ||
+        !strcmp(op, "/=") || !strcmp(op, "%=") || !strcmp(op, "&=") ||
+        !strcmp(op, "^=") || !strcmp(op, "|=") || !strcmp(op, "<<=") || !strcmp(op, ">>=")) {
+        ++pos;
         if (!e.lvalue || e.type->kind == TY_ARRAY)
-            error("compound assignment requires a local variable or dereferenced object on the left");
-        /* The destination address is evaluated once and reused. */
+            error("compound assignment requires an assignable object");
+        /* Keep the destination address across evaluation of the right operand. */
         emit("    sub sp, sp, #16\n    str x0, [sp]\n");
-        Expr right = value(expression());
+        Expr right = value(assignment_expr());
         emit("    ldr x9, [sp]\n");
         load_value_reg(e.type, "x9");
-        Expr res = binary_add((Expr){e.type, 0, -1, 0}, right, !pluseq);
-        res = convert(res, e.type);
+        Expr left = (Expr){e.type, 0, -1, 0}, res;
+        if (*op == '+' || *op == '-') res = binary_add(left, right, *op == '-');
+        else if (*op == '<' || *op == '>') res = shift_value(left, right, *op == '>');
+        else if (*op == '&' || *op == '^' || *op == '|')
+            res = bit_combine(left, right, *op == '|' ? 2 : *op == '^');
+        else {
+            if (!integer(left.type) || !integer(right.type))
+                error("compound multiplication, division and remainder currently require integers");
+            Type *t = common_integer(left.type, right.type);
+            if (wide(t)) {
+                if (!wide(left.type)) extend_reg(left.type, "w9", "x9");
+                if (!wide(right.type)) extend_reg(right.type, "w0", "x0");
+            }
+            if (*op == '*') emit_multiply(t);
+            else emit_divide(t, *op == '%');
+            res = (Expr){t, 0, -1, 0};
+        }
+        convert(res, e.type);
         emit("    ldr x11, [sp]\n    add sp, sp, #16\n");
         store_value(e.type, "x11");
         return (Expr){e.type, 0, -1, 0};
+    }
+    return e;
+}
+/* Full expression: assignment expressions joined by the comma operator.
+   Each left operand is evaluated for side effects and discarded. */
+static Expr expression(void) {
+    Expr e = assignment_expr();
+    while (take(",")) {
+        if (e.type->kind != TY_VOID) value(e);
+        e = assignment_expr();
     }
     return e;
 }
@@ -1569,8 +3036,9 @@ static void block(int function_body) {
     ++tag_depth;
     while (!take("}")) {
         if (!strcmp(current()->text, "<eof>")) error("expected '}' after block");
-        if (type_start() || !strcmp(current()->text, "typedef")) {
+        if (type_start() || !strcmp(current()->text, "typedef") || !strcmp(current()->text, "static")) {
             int is_alias = take("typedef");
+            int is_static = take("static");
             annotate_statement();
             Type *base = parse_specs();
             if (!strcmp(current()->text, ";")) {
@@ -1582,7 +3050,7 @@ static void block(int function_body) {
                 if (nlocals == 256) error("too many active local variables (limit: 256)");
                 char *s = name();
                 int previous = find_local(s);
-                type = array_suffix(type, 0, 0);
+                type = array_suffix(type, 0, is_static);
                 if (previous >= 0 && (size_t)previous >= scope_base) {
                     if (is_alias && locals[previous].offset == -1 &&
                         same_type(locals[previous].type, type) &&
@@ -1594,6 +3062,27 @@ static void block(int function_body) {
                     if (type->kind == TY_ARRAY && !type->size)
                         error("typedef array requires an explicit size");
                     locals[nlocals++] = (Local){s, -1, type, 1, 0};
+                } else if (is_static) {
+                    if (nglobals == 256) error("too many static objects");
+                    if (type->kind == TY_VOID) error("object cannot have void type");
+                    size_t g = nglobals++;
+                    char buffer[64];
+                    snprintf(buffer, sizeof(buffer), "__4c_static_%zu", g);
+                    globals[g] = (Local){copy(buffer, strlen(buffer)), 0, type, 1, 0};
+                    global_static[g] = 1;
+                    locals[nlocals++] = (Local){s, -4, type, 1, (int)g};
+                    if (take("=")) {
+                        size_t room = ntokens - pos + 1;
+                        InitEntry *entries = resize(NULL, room * sizeof(InitEntry));
+                        size_t count;
+                        if (take("{")) {
+                            count = parse_initializer(type, entries, room);
+                            expect("}");
+                        } else count = parse_one_initializer(type, entries, room);
+                        global_inits[g] = entries;
+                        global_init_counts[g] = count;
+                    }
+                    if (!type->size) error("static object has incomplete type");
                 } else {
                     if (type->kind == TY_VOID) error("object cannot have void type");
                     if (type->kind == TY_STRUCT || type->kind == TY_UNION)
@@ -1611,6 +3100,7 @@ static void block(int function_body) {
                     size_t local = nlocals++;
                     int offset = allocate(type);
                     locals[local] = (Local){s, offset, type, 0, 0};
+                    int initialized_member[32] = {0};
                     if (bytes.data) {
                         for (int i = 0; i < type->size; ++i) {
                             literal(i < (int)bytes.length ? bytes.data[i] : 0);
@@ -1623,7 +3113,7 @@ static void block(int function_body) {
                         int count = type->size / type->base->size, i = 0;
                         do {
                             if (i == count) error("too many array initializers");
-                            convert(expression(), type->base);
+                            convert(assignment_expr(), type->base);
                             emit("    add x9, x29, #%d\n", offset + i++ * type->base->size);
                             store_value(type->base, "x9");
                             if (!take(",")) break;
@@ -1633,8 +3123,57 @@ static void block(int function_body) {
                             emit("    sub x0, x0, x0\n    add x9, x29, #%d\n", offset + i * type->base->size);
                             store_value(type->base, "x9");
                         }
+                    } else if (initialize && (type->kind == TY_STRUCT ||
+                                              type->kind == TY_UNION)) {
+                        /* Positional brace initializer for a local record:
+                           one assignment-expression per member in order. */
+                        if (!strcmp(current()->text, "{")) {
+                        expect("{");
+                        for (int m = 0; m < type->nmembers; ++m) {
+                            if (m > 0) {
+                                if (!take(",")) break;
+                                if (!strcmp(current()->text, "}")) break;
+                            }
+                            Member *mem = &type->members[m];
+                            int moff = offset + mem->offset;
+                            convert(assignment_expr(), mem->type);
+                            emit("    add x9, x29, #%d\n", moff);
+                            store_value(mem->type, "x9");
+                            initialized_member[m] = 1;
+                        }
+                        take(",");
+                        expect("}");
+                        /* Zero-fill members after the last initializer. */
+                        for (int m = 0; m < type->nmembers; ++m)
+                            if (!initialized_member[m]) {
+                                /* Zero the member's bytes with a scalar loop. */
+                                Type *mt = type->members[m].type;
+                                int words = (mt->size + 7) / 8;
+                                for (int w = 0; w < words; ++w) {
+                                    emit("    sub x0, x0, x0\n");
+                                    emit("    add x9, x29, #%d\n",
+                                         offset + type->members[m].offset + w * 8);
+                                    int rem = mt->size - w * 8;
+                                    if (rem >= 8) {
+                                        emit("    str x0, [x9]\n");
+                                    } else {
+                                        for (int b = 0; b < rem; ++b) {
+                                            emit("    add x9, x29, #%d\n",
+                                                 offset + type->members[m].offset + w * 8 + b);
+                                            emit("    strb w0, [x9]\n");
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            /* Aggregate initializer from an expression, such
+                               as a call returning the record by value. */
+                            convert(assignment_expr(), type);
+                            emit("    add x9, x29, #%d\n", offset);
+                            store_value(type, "x9");
+                        }
                     } else if (initialize) {
-                        convert(expression(), type);
+                        convert(assignment_expr(), type);
                         emit("    add x9, x29, #%d\n", offset);
                         store_value(type, "x9");
                     }
@@ -1674,7 +3213,7 @@ static void statement(void) {
     if (take("if")) {
         size_t id = next_label++;
         condition_comment(start);
-        expect("("); Expr cond = value(expression()); expect(")");
+        expect("("); Expr cond = condition_value(expression()); expect(")");
         emit("    cbz %s0, .Lelse%zu\n", wide(cond.type) ? "x" : "w", id);
         statement();
         if (take("else")) {
@@ -1691,11 +3230,13 @@ static void statement(void) {
         size_t id = next_label++;
         emit(".Lwhile%zu:\n", id);
         condition_comment(start);
-        expect("("); Expr cond = value(expression()); expect(")");
+        expect("("); Expr cond = condition_value(expression()); expect(")");
         emit("    cbz %s0, .Lendwhile%zu\n", wide(cond.type) ? "x" : "w", id);
         push_break(".Lendwhile%zu", id);
+        push_continue(".Lwhile%zu", id);
         statement();
         pop_break();
+        --continue_depth;
         emit("    cbz xzr, .Lwhile%zu\n.Lendwhile%zu:\n", id, id);
         return;
     }
@@ -1703,14 +3244,40 @@ static void statement(void) {
         size_t id = next_label++;
         condition_comment(start);
         expect("(");
-        if (strcmp(current()->text, ";")) {
+        size_t saved_locals = nlocals, saved_base = scope_base, saved_tags = ntags;
+        int saved_frame = frame_bytes;
+        scope_base = nlocals;
+        ++tag_depth;
+        if (type_start()) {
+            Type *base = parse_specs();
+            for (;;) {
+                Type *type = consume_stars(base);
+                char *s = name();
+                Type *dec = array_suffix(type, 0, 0);
+                if (dec->kind == TY_VOID) error("for-loop variable cannot have void type");
+                if (!dec->size) error("for-loop variable has incomplete type");
+                int previous = find_local(s);
+                if (previous >= 0 && (size_t)previous >= scope_base) error("duplicate loop variable");
+                if (nlocals == 256) error("too many active local variables");
+                size_t local = nlocals++;
+                int offset = allocate(dec);
+                locals[local] = (Local){s, offset, dec, 0, 0};
+                if (take("=")) {
+                    convert(assignment_expr(), dec);
+                    emit("    add x9, x29, #%d\n", offset);
+                    store_value(dec, "x9");
+                }
+                locals[local].initialized = 1;
+                if (!take(",")) break;
+            }
+        } else if (strcmp(current()->text, ";")) {
             Expr init = expression();
             if (init.type->kind != TY_VOID) value(init);
         }
         expect(";");
         emit(".Lfor%zu:\n", id);
         if (strcmp(current()->text, ";")) {
-            Expr cond = value(expression());
+            Expr cond = condition_value(expression());
             emit("    cbz %s0, .Lendfor%zu\n", wide(cond.type) ? "x" : "w", id);
         }
         expect(";");
@@ -1726,8 +3293,11 @@ static void statement(void) {
         expect(")");
         body = main_stream;
         push_break(".Lendfor%zu", id);
+        push_continue(".Lfor_step%zu", id);
         statement();
         pop_break();
+        --continue_depth;
+        emit(".Lfor_step%zu:\n", id);
         if (step_buffer) {
             if (fflush(step_buffer) || fseek(step_buffer, 0, SEEK_SET))
                 fatal("cannot rewind step buffer");
@@ -1737,17 +3307,25 @@ static void statement(void) {
             fclose(step_buffer);
         }
         emit("    cbz xzr, .Lfor%zu\n.Lendfor%zu:\n", id, id);
+        nlocals = saved_locals;
+        scope_base = saved_base;
+        frame_bytes = saved_frame;
+        ntags = saved_tags;
+        --tag_depth;
         return;
     }
     if (take("do")) {
         size_t id = next_label++;
         emit(".Ldo%zu:\n", id);
         push_break(".Ldo_end%zu", id);
+        push_continue(".Ldo_cond%zu", id);
         statement();
         pop_break();
+        --continue_depth;
         expect("while");
+        emit(".Ldo_cond%zu:\n", id);
         condition_comment(pos);
-        expect("("); Expr cond = value(expression()); expect(")");
+        expect("("); Expr cond = condition_value(expression()); expect(")");
         emit("    cbz %s0, .Ldo_end%zu\n", wide(cond.type) ? "x" : "w", id);
         emit("    cbz xzr, .Ldo%zu\n.Ldo_end%zu:\n", id, id);
         expect(";");
@@ -1761,10 +3339,13 @@ static void statement(void) {
         expect(")");
         if (!(integer(v.type) || v.type->kind == TY_PTR))
             error("switch requires an integer or pointer expression");
+        if (integer(v.type)) v = convert(v, promote(v.type));
         int slot = allocate(v.type);
         emit("    add x10, x29, #%d\n", slot);
         store_value(v.type, "x10");
         emit("    cbz xzr, .Lsw%zu_disp\n", id);
+        if (switch_depth + 1 >= (int)(sizeof(switch_ids) / sizeof(switch_ids[0])))
+            error("switch nesting is too deep");
         ++switch_depth;
         switch_ids[switch_depth] = id;
         switch_case_count[switch_depth] = 0;
@@ -1805,7 +3386,9 @@ static void statement(void) {
     }
     if (take("continue")) {
         expect(";");
-        error("continue is not supported yet");
+        if (!continue_depth) error("continue outside a loop");
+        emit("    cbz xzr, %s\n", continue_names[continue_depth - 1]);
+        return;
     }
     if (take("case") || take("default")) {
         int is_default = !strcmp(tokens[pos - 1].text, "default");
@@ -1837,11 +3420,29 @@ static void statement(void) {
         return;
     }
     if (take("return")) {
-        if (functions[current_function].result->kind == TY_VOID) {
+        Type *rt = functions[current_function].result;
+        if (rt->kind == TY_VOID) {
             if (strcmp(current()->text, ";")) error("void function cannot return a value");
         } else {
             if (!strcmp(current()->text, ";")) error("non-void function must return a value");
-            convert(expression(), functions[current_function].result);
+            convert(expression(), rt);
+            if (aggregate(rt)) {
+                if (rt->size > 16) {
+                    /* x8 held the caller's result buffer; copy bytes there. */
+                    emit("    ldr x9, [x29, #%d]\n",
+                         functions[current_function].result_ptr_offset);
+                    int words = (rt->size + 7) / 8;
+                    for (int w = 0; w < words; ++w) {
+                        emit("    ldr x12, [x0, #%d]\n", w * 8);
+                        emit("    str x12, [x9, #%d]\n", w * 8);
+                    }
+                } else {
+                    /* Small aggregates return in x0 and x1. Load x1 first so
+                       the source address survives the final load. */
+                    if (rt->size > 8) emit("    ldr x1, [x0, #8]\n");
+                    emit("    ldr x0, [x0]\n");
+                }
+            }
         }
         expect(";");
         emit("    cbz xzr, .Lreturn%zu\n", current_function);
@@ -1852,34 +3453,96 @@ static void statement(void) {
     }
 }
 
+/* Count encoded instructions in the finished body, including buffered loop
+   steps. Comments and label spelling do not consume instruction range. */
+static size_t function_code_bytes(void) {
+    if (fflush(body) || fseek(body, 0, SEEK_SET)) fatal("cannot rewind assembly buffer");
+    size_t bytes = 0;
+    int ch, start = 1;
+    while ((ch = fgetc(body)) != EOF) {
+        if (ch == '\n') { start = 1; continue; }
+        if (!start || isspace(ch)) continue;
+        start = 0;
+        if (ch >= 'a' && ch <= 'z') bytes += 4;
+    }
+    if (ferror(body)) fatal("cannot measure assembly buffer");
+    return bytes;
+}
+
 static void emit_function(size_t start, size_t open, size_t first_constant) {
     Function *fn = &functions[current_function];
-    const char *prefix = macos ? "_" : "";
+    const char *prefix = fn->internal ? ".L" : macos ? "_" : "";
     int frame = (max_frame_bytes + 15) & ~15;
     FILE *out = program;
-    fprintf(out, ".text\n.p2align 2\n.globl %s%s\n", prefix, fn->name);
-    if (!macos) fprintf(out, ".type %s, %%function\n", fn->name);
+    fprintf(out, ".text\n.p2align 2\n");
+    if (!fn->internal && !fn->static_linkage) fprintf(out, ".globl %s%s\n", prefix, fn->name);
+    if (!macos) fprintf(out, ".type %s%s, %%function\n", prefix, fn->name);
     source_comment(out, start, open);
     fprintf(out, "%s%s:\n"
                  "    sub sp, sp, #%d\n"
                  "    str x29, [sp]\n"
                  "    str x30, [sp, #8]\n"
                  "    add x29, sp, #0\n", prefix, fn->name, frame);
-    for (int i = 0; i < fn->nparams; ++i)
-        fprintf(out, "    %s %s%d, [x29, #%d]\n",
-                fn->params[i]->kind == TY_CHAR || fn->params[i]->kind == TY_BOOL ? "strb" : "str",
-                wide(fn->params[i]) ? "x" : "w", i, 16 + i * 8);
+    /* Variadic functions save x0..x7 so va_list can read unnamed args. The
+       save area overlaps the named-parameter slots (x_i = named param i). */
+    if (fn->variadic) {
+        int save_off = fn->va_save_offset;
+        for (int i = 0; i < 8; ++i)
+            fprintf(out, "    str x%d, [x29, #%d]\n", i, save_off + i * 8);
+        int fp_off = fn->fp_save_offset;
+        for (int i = 0; i < 8; ++i)
+            fprintf(out, "    str d%d, [x29, #%d]\n", i, fp_off + i * 16);
+    }
+    /* Save the indirect-result pointer for functions returning large
+       aggregates; the caller's buffer address arrives in x8. */
+    if (fn->result_ptr_offset)
+        fprintf(out, "    str x8, [x29, #%d]\n", fn->result_ptr_offset);
+    int gp = 0, fp = 0, stack_running = 0;
+    for (int i = 0; i < fn->nparams; ++i) {
+        Type *pt = fn->params[i];
+        int off = locals[i].offset;
+        if (pt->kind == TY_DOUBLE) {
+            fprintf(out, "    str d%d, [x29, #%d]\n", fp++, off);
+        } else if (aggregate(pt)) {
+            int slots = aggregate_slots(pt);
+            if (slots == 1) {
+                fprintf(out, "    str x%d, [x29, #%d]\n", gp++, off);
+            } else if (slots == 2) {
+                fprintf(out, "    str x%d, [x29, #%d]\n", gp, off);
+                fprintf(out, "    str x%d, [x29, #%d]\n", gp + 1, off + 8);
+                gp += 2;
+            } else {
+                /* Larger than 16 bytes: the caller copied the bytes into the
+                   stack overflow area. Walk cumulative offsets so multiple
+                   stack arguments line up with the caller's layout. */
+                int words = (pt->size + 7) / 8;
+                fprintf(out, "    add x9, x29, #%d\n", frame);
+                if (stack_running)
+                    fprintf(out, "    add x9, x9, #%d\n", stack_running);
+                fprintf(out, "    add x10, x29, #%d\n", off);
+                for (int w = 0; w < words; ++w)
+                    fprintf(out, "    ldr x12, [x9, #%d]\n"
+                                 "    str x12, [x10, #%d]\n", w * 8, w * 8);
+                stack_running += (pt->size + 7) & ~7;
+            }
+        } else {
+            fprintf(out, "    %s %s%d, [x29, #%d]\n",
+                    pt->kind == TY_CHAR || pt->kind == TY_BOOL ? "strb" : "str",
+                    wide(pt) ? "x" : "w", gp++, off);
+        }
+    }
     if (fflush(body) || fseek(body, 0, SEEK_SET)) fatal("cannot rewind assembly buffer");
     int ch;
     while ((ch = fgetc(body)) != EOF) fputc(ch, out);
     if (ferror(body)) fatal("cannot read assembly buffer");
-    fprintf(out, "    // Shared function epilogue.\n"
-                 ".Lreturn%zu:\n"
-                 "    ldr x30, [sp, #8]\n"
+    fprintf(out, "    // Shared function epilogue.\n.Lreturn%zu:\n", current_function);
+    if (fn->result->kind == TY_DOUBLE)
+        fprintf(out, "    sub sp, sp, #16\n    str x0, [sp]\n    ldr d0, [sp]\n    add sp, sp, #16\n");
+    fprintf(out, "    ldr x30, [sp, #8]\n"
                  "    ldr x29, [sp]\n"
                  "    add sp, sp, #%d\n"
-                 "    ret\n", current_function, frame);
-    if (!macos) fprintf(out, ".size %s, .-%s\n", fn->name, fn->name);
+                 "    ret\n", frame);
+    if (!macos) fprintf(out, ".size %s%s, .-%s%s\n", prefix, fn->name, prefix, fn->name);
     for (size_t i = first_constant; i < nconstants; ++i)
         fprintf(out, ".LC%zu:\n    .word 0x%08lx\n", i, (unsigned long)constants[i]);
 }
@@ -1887,10 +3550,43 @@ static void emit_function(size_t start, size_t open, size_t first_constant) {
 static void parse(void) {
     int have_main = 0;
     global_scope = 1;
-    while (strcmp(current()->text, "<eof>")) {
+    for (;;) {
+        if (!strcmp(current()->text, "<eof>")) {
+            if (!need_softfloat || compiling_softfloat) break;
+            compiling_softfloat = 1;
+            tokens = NULL; ntokens = capacity = pos = 0;
+            size_t length = 0;
+            for (size_t i = 0; i < sizeof(softfloat_source)/sizeof(*softfloat_source); ++i)
+                length += strlen(softfloat_source[i]);
+            char *source = resize(NULL, length + 1), *end = source;
+            for (size_t i = 0; i < sizeof(softfloat_source)/sizeof(*softfloat_source); ++i) {
+                size_t n = strlen(softfloat_source[i]);
+                memcpy(end, softfloat_source[i], n); end += n;
+            }
+            *end = 0;
+            lex_source("<4c software binary64>", source, 0);
+        }
+        if (!strcmp(current()->text, "_Static_assert")) {
+            ++pos;
+            expect("(");
+            uint64_t value = 0;
+            suppress_emit = 1;
+            const_expr_or(&value);
+            suppress_emit = 0;
+            expect(",");
+            if (current()->text[0] != '"') error("_Static_assert message must be a string literal");
+            String msg = decode_literal();
+            expect(")");
+            expect(";");
+            if (!value)
+                fatal("static assertion failed: %.*s", (int)msg.length, msg.data);
+            continue;
+        }
         size_t start = pos;
         int is_alias = take("typedef");
+        int is_static = take("static");
         int is_extern = take("extern");
+        if (is_static && (is_extern || is_alias)) error("conflicting storage classes");
         Type *base = parse_specs();
         Type *result = consume_stars(base);
         if (!strcmp(current()->text, ";")) {
@@ -1902,8 +3598,6 @@ static void parse(void) {
         if (!is_alias && !strcmp(current()->text, "(")) {
             if (find_global(s) >= 0) error("name already declared as an object or typedef");
             if (result->kind == TY_ARRAY) error("function cannot return an array");
-            if (result->kind == TY_STRUCT || result->kind == TY_UNION)
-                error("aggregate results are not supported yet");
             expect("(");
             char *params[8] = {0};
             Type *param_types[8] = {0};
@@ -1930,9 +3624,6 @@ static void parse(void) {
                         if (params[i] && params[nparams] && !strcmp(params[i], params[nparams]))
                             error("duplicate parameter name");
                     if (param_types[nparams]->kind == TY_VOID) error("parameter cannot have void type");
-                    if (param_types[nparams]->kind == TY_STRUCT ||
-                        param_types[nparams]->kind == TY_UNION)
-                        error("aggregate parameters are not supported yet");
                     if (params[nparams])
                         locals[nlocals++] = (Local){params[nparams], 0, param_types[nparams], 1, 0};
                     ++nparams;
@@ -1947,15 +3638,18 @@ static void parse(void) {
             if (!strcmp(s, "main") && result->kind != TY_INT) error("main must return int");
             int index = find_function(s);
             if (index < 0) {
-                if (nfunctions == 256) error("too many function declarations");
+                if (nfunctions == (compiling_softfloat ? 288u : 256u)) error("too many function declarations");
                 index = (int)nfunctions++;
-                functions[index] = (Function){.name=s, .nparams=nparams, .variadic=variadic, .result=result};
+                functions[index] = (Function){.name=s, .nparams=nparams, .variadic=variadic,
+                    .result=result, .internal=compiling_softfloat, .static_linkage=is_static};
                 for (int i = 0; i < nparams; ++i) functions[index].params[i] = param_types[i];
             } else if (functions[index].nparams != nparams ||
                        functions[index].variadic != variadic ||
                        !same_type(functions[index].result, result)) {
                 error("conflicting function declaration");
             }
+            if (is_static && !functions[index].static_linkage)
+                error("static declaration follows external function declaration");
             for (int i = 0; i < nparams; ++i)
                 if (!same_type(functions[index].params[i], param_types[i])) error("conflicting function declaration");
             if (!definition) { expect(";"); continue; }
@@ -1968,11 +3662,36 @@ static void parse(void) {
             nlocals = (size_t)nparams;
             scope_base = 0;
             frame_bytes = max_frame_bytes = 16;
+            /* For variadic definitions, allocate a save area for x0..x7, one
+               for d0..d7, and a __va_list_tag in the frame. The GP save area
+               overlaps named-parameter slots (x_i = named param i). */
+            if (variadic) {
+                functions[index].va_save_offset = 16;
+                functions[index].va_tag_offset = 16 + 64;
+                functions[index].fp_save_offset = 16 + 64 + 40;
+                int overhead = functions[index].fp_save_offset + 128;
+                if (overhead > (int)max_frame_bytes) max_frame_bytes = overhead;
+            }
             global_scope = 0;
             for (int i = 0; i < nparams; ++i) {
                 if (!params[i]) error("function definitions require parameter names");
+                if (variadic && (param_types[i]->kind == TY_STRUCT ||
+                                 param_types[i]->kind == TY_UNION))
+                    error("variadic functions cannot take aggregate parameters yet");
                 locals[i] = (Local){params[i], allocate(param_types[i]), param_types[i], 1, 0};
             }
+            /* Body locals must start above the variadic save areas so that
+               va_list bookkeeping is not clobbered by user locals. */
+            if (variadic) {
+                int overhead = functions[index].fp_save_offset + 128;
+                if (frame_bytes < overhead) frame_bytes = overhead;
+                if (max_frame_bytes < overhead) max_frame_bytes = overhead;
+            }
+            /* Functions returning aggregates larger than sixteen bytes use
+               the x8 indirect-result convention: reserve a slot to hold the
+               caller's buffer address across the body. */
+            if (aggregate(result) && result->size > 16)
+                functions[index].result_ptr_offset = allocate(&long_type);
             body = tmpfile();
             if (!body) fatal("cannot create assembly buffer: %s", strerror(errno));
             body_chars = 0;
@@ -1986,8 +3705,12 @@ static void parse(void) {
             }
             emit("    sub w0, w0, w0\n");
             /* Each function has its own nearby literal pool and return epilogue. */
-            if (body_chars > 262144 || nconstants - first_constant > 16384)
-                fatal("function exceeds code-size limit");
+            size_t code_bytes = function_code_bytes();
+            /* LDR literals and CBZ have a signed one-megabyte reach. Reserve
+               4 KiB for the prologue, epilogue and alignment around the body. */
+            if (code_bytes + (nconstants - first_constant) * 4 + 4096 >= 1048576)
+                fatal("function %s exceeds code-size limit (%zu instruction bytes, %zu constants)",
+                      s, code_bytes, nconstants - first_constant);
             emit_function(start, open, first_constant);
             fclose(body);
             nlocals = 0;
@@ -2008,39 +3731,39 @@ static void parse(void) {
                 error("global object must have scalar type");
             if (is_extern) {
                 if (take("=")) error("extern declarations cannot have an initializer");
-            } else if (type->kind == TY_ARRAY || type->kind == TY_STRUCT ||
-                       type->kind == TY_UNION) {
-                if (take("=")) error("global aggregate initializers are not supported yet");
             }
             int initialized = 0;
-            uint64_t initial = 0;
+            InitEntry *init_entries = NULL;
+            size_t init_count = 0;
             if (!is_alias && take("=")) {
                 initialized = 1;
-                int negative = take("-");
-                if (!negative) take("+");
-                if (current()->text[0] == '\'') {
-                    String str = decode_literal();
-                    if (str.length != 1) error("character literal must contain one byte");
-                    initial = str.data[0];
-                    if (macos && initial >= 128) initial -= 256;
-                    free(str.data);
+                int nentries = (type->size ? type->size : 8) + 16;
+                init_entries = resize(NULL, nentries * sizeof(InitEntry));
+                if (!strcmp(current()->text, "{")) {
+                    ++pos;
+                    init_count = parse_initializer(type, init_entries, nentries);
+                    if (!take("}")) error("expected '}' at end of initializer");
                 } else {
-                    IntConst c = int_literal();
-                    initial = c.value;
+                    init_count = parse_one_initializer(type, init_entries, nentries);
                 }
-                if (negative) initial = 0 - initial;
-                if (type->kind == TY_PTR && initial != 0)
-                    error("global pointer initializer must be zero");
             }
+            if (previous >= 0 && !is_alias &&
+                ((is_static && !global_static[previous]) ||
+                 (!is_static && !is_extern && global_static[previous])))
+                error("conflicting object linkage");
             if (previous < 0) {
                 if (nglobals == 256) error("too many global declarations");
                 previous = (int)nglobals++;
                 globals[previous] = (Local){s, is_alias ? -1 : (is_extern ? -3 : 0), type, 0, 0};
+                global_static[previous] = is_static;
             }
+            if (!is_alias && !is_extern && globals[previous].offset == -3)
+                globals[previous].offset = 0;
             if (initialized) {
                 if (globals[previous].initialized) error("duplicate global definition");
                 globals[previous].initialized = 1;
-                global_values[previous] = initial;
+                global_inits[previous] = init_entries;
+                global_init_counts[previous] = init_count;
             }
             if (!take(",")) break;
             result = consume_stars(base);
@@ -2049,27 +3772,68 @@ static void parse(void) {
         expect(";");
     }
     if (!have_main) error("expected an int main() definition");
+    if (need_softfloat) {
+        /* One-bit unsigned shift, synthesized from bit tests and shifted ADD.
+           This primitive is private to the software routines; it is not C >>. */
+        fprintf(program, ".text\n.p2align 2\n.type .L__4c_sf_shr1, %%function\n.L__4c_sf_shr1:\n"
+                         "    sub x9, x9, x9\n    sub x10, x10, x10\n    add x10, x10, #1\n");
+        for (int bit = 1; bit < 64; ++bit)
+            fprintf(program, "    tbz x0, #%d, .Lsf_shift%d\n    add x9, x9, x10, lsl #%d\n.Lsf_shift%d:\n",
+                    bit, bit, bit - 1, bit);
+        fprintf(program, "    sub x0, x9, xzr\n    ret\n.size .L__4c_sf_shr1, .-.L__4c_sf_shr1\n");
+    }
     for (size_t i = 0; i < nglobals; ++i) {
         Local *g = &globals[i];
         if (g->offset < 0) continue; /* typedefs and enum constants */
         const char *prefix = macos ? "_" : "";
         int a = alignment(g->type), p2 = 0;
         while ((1 << p2) < a) ++p2;
-        fprintf(program, ".data\n.p2align %d\n.globl %s%s\n", p2, prefix, g->name);
+        fprintf(program, ".data\n.p2align %d\n", p2);
+        if (!global_static[i]) fprintf(program, ".globl %s%s\n", prefix, g->name);
         if (!macos) fprintf(program, ".type %s, %%object\n.size %s, %d\n", g->name, g->name, g->type->size);
         fprintf(program, "%s%s:\n", prefix, g->name);
-        if (g->type->kind == TY_ARRAY || g->type->kind == TY_STRUCT ||
-            g->type->kind == TY_UNION) {
-            fprintf(program, "    .zero %d\n", g->type->size);
+        if (g->initialized && global_inits[i]) {
+            size_t n = global_init_counts[i];
+            InitEntry *entries = global_inits[i];
+            /* Lay the initializer out at the type's true member offsets so
+               struct padding between fields is preserved (e.g. the pad after
+               an int kind member before an 8-byte pointer member). */
+            size_t cursor = 0;
+            if (g->type->kind == TY_STRUCT || g->type->kind == TY_UNION) {
+                for (int m = 0; m < g->type->nmembers; ++m) {
+                    Member *mem = &g->type->members[m];
+                    size_t moff = (size_t)mem->offset;
+                    size_t msize = (size_t)mem->type->size;
+                    while (cursor < moff) {
+                        fprintf(program, "    .byte 0\n");
+                        ++cursor;
+                    }
+                    if (m < (int)n) emit_init_entry(entries[m]);
+                    cursor += msize;
+                }
+            } else {
+                for (size_t j = 0; j < n; ++j) emit_init_entry(entries[j]);
+                for (size_t j = 0; j < n; ++j) {
+                    Type *t = entries[j].type;
+                    if (!t) t = &int_type;
+                    switch (t->kind) {
+                    case TY_PTR: case TY_ULONG: case TY_LONG: case TY_DOUBLE:
+                        cursor += 8; break;
+                    case TY_INT: case TY_UINT: case TY_BOOL:
+                        cursor += 4; break;
+                    case TY_CHAR:
+                        cursor += 1; break;
+                    default:
+                        cursor += 4; break;
+                    }
+                }
+            }
+            while (cursor < (size_t)g->type->size) {
+                fprintf(program, "    .byte 0\n");
+                ++cursor;
+            }
         } else {
-            fprintf(program, "    %s %llu\n",
-                    g->type->kind == TY_PTR || g->type->kind == TY_LONG ||
-                            g->type->kind == TY_ULONG
-                        ? ".quad"
-                        : g->type->kind == TY_CHAR ? ".byte" : ".word",
-                    (unsigned long long)(g->type->kind == TY_CHAR
-                                             ? global_values[i] & 255
-                                             : global_values[i]));
+            fprintf(program, "    .zero %d\n", g->type->size);
         }
     }
     if (nstrings) {
@@ -2082,6 +3846,8 @@ static void parse(void) {
     }
     if (!macos) fprintf(program, ".section .note.GNU-stack,\"\",%%progbits\n");
 }
+
+#include "asm_comments.h"
 
 int main(int argc, char **argv) {
     const char *input = NULL, *output = NULL;
@@ -2120,8 +3886,7 @@ int main(int argc, char **argv) {
     FILE *out = output ? fopen(output, "w") : stdout;
     if (!out) fatal("cannot open output %s: %s", output, strerror(errno));
     if (fflush(program) || fseek(program, 0, SEEK_SET)) fatal("cannot rewind program buffer");
-    int ch;
-    while ((ch = fgetc(program)) != EOF) fputc(ch, out);
+    write_annotated_assembly(program, out);
     if (ferror(program)) fatal("cannot read program buffer");
     if (fflush(out) || ferror(out)) fatal("cannot write assembly output");
     if (output && fclose(out)) fatal("cannot close assembly output");
