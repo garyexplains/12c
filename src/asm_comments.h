@@ -35,12 +35,12 @@ static const char *asm_branch_reason(const char *label) {
 }
 
 static const char *asm_call_reason(const char *symbol) {
-    if (strstr(symbol, "__4c_sf_i64")) return "convert a signed integer to double bits using software rounding";
-    if (strstr(symbol, "__4c_sf_u64")) return "convert an unsigned integer to double bits using software rounding";
-    if (strstr(symbol, "__4c_sf_binary")) return "multiply or divide double bit patterns using only the allowed instructions";
-    if (strstr(symbol, "__4c_sf_pack")) return "normalize and round a software double result";
-    if (strstr(symbol, "__4c_sf_jam")) return "shift while remembering discarded nonzero bits for rounding";
-    if (strstr(symbol, "__4c_sf_shr")) return "shift an unsigned bit pattern using the restricted instruction vocabulary";
+    if (strstr(symbol, "__12c_sf_i64")) return "convert a signed integer to double bits using software rounding";
+    if (strstr(symbol, "__12c_sf_u64")) return "convert an unsigned integer to double bits using software rounding";
+    if (strstr(symbol, "__12c_sf_binary")) return "multiply or divide double bit patterns using only the allowed instructions";
+    if (strstr(symbol, "__12c_sf_pack")) return "normalize and round a software double result";
+    if (strstr(symbol, "__12c_sf_jam")) return "shift while remembering discarded nonzero bits for rounding";
+    if (strstr(symbol, "__12c_sf_shr")) return "shift an unsigned bit pattern using the restricted instruction vocabulary";
     if (*symbol == '_') ++symbol; /* Darwin's external-symbol prefix. */
     if (!strcmp(symbol, "putchar")) return "write the character in w0 through the C runtime";
     if (!strcmp(symbol, "printf")) return "format and print the staged arguments through the C runtime";
@@ -64,7 +64,7 @@ static void annotated_asm_line(FILE *out, const char *line, AsmCommentState *sta
         state->arithmetic_reason = NULL;
     }
     if (length && start[length - 1] == ':' &&
-        (*start != '.' || asm_starts(start, ".L__4c_"))) state->frame_phase = 1;
+        (*start != '.' || asm_starts(start, ".L__12c_"))) state->frame_phase = 1;
     if (!*start || *start == '.' || asm_starts(start, "//") || start[length - 1] == ':') {
         if (length && start[length - 1] == ':') {
             if (asm_starts(start, ".Lcmp_end") || asm_starts(start, ".Lcopy_end") || asm_starts(start, ".Ldvo")) state->arithmetic_reason = NULL;

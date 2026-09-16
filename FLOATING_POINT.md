@@ -16,13 +16,13 @@ rejected until its ABI implementation and native validation are complete.
   hold binary64 bits in `x0`; loads, stores and temporary spills preserve bits.
 - Decimal literals are checked separately from integer tokens. Host `strtod`
   supplies compile-time binary64 bits in the process's initial C locale and
-  default rounding mode (4c never changes either). The build requires a
+  default rounding mode (12c never changes either). The build requires a
   binary64 host double and checks its representation; literal overflow is an
   error. Subnormal literals are supported; suffixes and hex floats are rejected.
-- [src/softfloat.h](src/softfloat.h) embeds ordinary C within 4c's supported
-  integer subset. When conversions or arithmetic need it, 4c lexes and compiles
+- [src/softfloat.h](src/softfloat.h) embeds ordinary C within 12c's supported
+  integer subset. When conversions or arithmetic need it, 12c lexes and compiles
   this bundle after the user's functions. It is never compiled by the host C
-  compiler. Symbols have private `.L__4c_` labels, and `__4c_` is reserved from
+  compiler. Symbols have private `.L__12c_` labels, and `__12c_` is reserved from
   user declarations. The primitive unsigned right shift by one is emitted as
   63 `TBZ` tests and shifted `ADD` operations; C shift operators are not added.
 - Internal conversion entries accept an integer in `x0` and return binary64 bits

@@ -1,4 +1,4 @@
-/* Controlled stdio declarations for 4c; implementations come from libc. */
+/* Controlled stdio declarations for 12c; implementations come from libc. */
 #include <stdarg.h>
 typedef struct FILE FILE;
 typedef unsigned long size_t;

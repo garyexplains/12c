@@ -1,7 +1,7 @@
-# Self-hosting 4c
+# Self-hosting 12c
 
-The active goal is to compile the existing `src/4c.c`, including
-`src/softfloat.h` and `src/asm_comments.h`, with 4c on AArch64 Linux.
+The active goal is to compile the existing `src/12c.c`, including
+`src/softfloat.h` and `src/asm_comments.h`, with 12c on AArch64 Linux.
 Keep the source readable and implement the C features it uses rather than
 rewriting those features away. Generated code must still use the twelve allowed
 instruction mnemonics. System assembly, linking, startup code, and libc remain
@@ -53,11 +53,11 @@ resolve, the sequence below produces byte-identical assembly at the fixpoint:
 ```sh
 make
 cp src/softfloat.h src/asm_comments.h include/
-./build/4c --target linux -I include src/4c.c -o /tmp/stage2.s   # stage 1 -> 2
+./build/12c --target linux -I include src/12c.c -o /tmp/stage2.s   # stage 1 -> 2
 cc /tmp/stage2.s -o /tmp/stage2
-/tmp/stage2 --target linux -I include src/4c.c -o /tmp/stage3.s  # stage 2 -> 3
+/tmp/stage2 --target linux -I include src/12c.c -o /tmp/stage3.s  # stage 2 -> 3
 cc /tmp/stage3.s -o /tmp/stage3
-/tmp/stage3 --target linux -I include src/4c.c -o /tmp/stage4.s  # stage 3 -> 4
+/tmp/stage3 --target linux -I include src/12c.c -o /tmp/stage4.s  # stage 3 -> 4
 cmp /tmp/stage3.s /tmp/stage4.s                                  # converges
 ```
 

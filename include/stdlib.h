@@ -1,4 +1,4 @@
-/* Controlled stdlib declarations for 4c; implementations come from libc. */
+/* Controlled stdlib declarations for 12c; implementations come from libc. */
 typedef unsigned long size_t;
 #define NULL (void *)0
 void *malloc(size_t size);

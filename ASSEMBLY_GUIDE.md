@@ -1,6 +1,6 @@
 # From C to twelve AArch64 instructions
 
-4c translates a small C language into assembly for an AArch64 processor. Its
+12c translates a small C language into assembly for an AArch64 processor. Its
 generated code uses just twelve instruction names. This guide connects those
 instructions to familiar C operations: creating a variable, assigning a value,
 calling a function, testing a condition, and walking through memory.
@@ -9,7 +9,7 @@ You can read the assembly without running an AArch64 machine:
 
 ```sh
 make
-./build/4c --target linux examples/hello.c -o build/hello.s
+./build/12c --target linux examples/hello.c -o build/hello.s
 ```
 
 Open `build/hello.s`. A `// C line ...` comment identifies the source statement.
@@ -24,8 +24,8 @@ cc build/hello.s -o build/hello
 ./build/hello
 ```
 
-Here `cc` assembles and links 4c's output. It does not compile the example's C.
-The twelve-instruction rule applies to code emitted by 4c, including its software
+Here `cc` assembles and links 12c's output. It does not compile the example's C.
+The twelve-instruction rule applies to code emitted by 12c, including its software
 floating-point routines. System startup code, libc and linker-generated code
 have their own instructions and are outside that rule.
 
@@ -57,7 +57,7 @@ attached to a C variable.
 
 ## The twelve instructions
 
-| Instruction | What it does | Why 4c needs it |
+| Instruction | What it does | Why 12c needs it |
 | --- | --- | --- |
 | `LDR` | Load a value from memory. | Read locals, pointers, literal constants, saved registers and double bits. |
 | `STR` | Store a value in memory. | Assign objects, save parameters and protect intermediate values across calls. |
@@ -115,7 +115,7 @@ The constant is in a *literal pool* after the function's return code:
     .word 0x00000041    // Four bytes of data representing 65; not executed.
 ```
 
-4c uses literal loads instead of relying on a `MOV` constant-building instruction.
+12c uses literal loads instead of relying on a `MOV` constant-building instruction.
 The destination `w0` selects a 32-bit load. The address stays in a 64-bit register
 because AArch64 pointers are 64 bits. `STR w0` writes four bytes, even though
 the address register is 64 bits wide.
@@ -180,9 +180,9 @@ For this call, the ABI expects the character argument in `w0`:
 ```
 
 Why save and immediately reload a single argument? The same strategy also handles
-multiple arguments and nested calls. 4c evaluates each argument into its own
+multiple arguments and nested calls. 12c evaluates each argument into its own
 temporary slot before loading the final argument registers. A call inside a later
-argument cannot destroy an earlier argument's value. 4c chooses left-to-right
+argument cannot destroy an earlier argument's value. 12c chooses left-to-right
 argument evaluation; portable C programs must not assume all C compilers do so.
 
 Integer and pointer arguments use `w0`/`x0` onward according to width. Results use
@@ -196,7 +196,7 @@ spells this external symbol `_putchar`; the Linux symbol is `putchar`.
 
 ## 5. Return to the caller
 
-For `return 0`, 4c loads zero into `w0` and jumps to its shared epilogue:
+For `return 0`, 12c loads zero into `w0` and jumps to its shared epilogue:
 
 ```asm
     ldr w0, .Lzero      // Load zero; set main's integer return value.
@@ -242,7 +242,7 @@ Equality needs a difference and a zero test:
 The remaining paths explicitly produce 0 or 1. No `CMP`, condition-code branch,
 or conditional-select instruction is needed.
 
-Signed ordering is more subtle: subtracting two signed values can wrap. 4c uses
+Signed ordering is more subtle: subtracting two signed values can wrap. 12c uses
 `TBZ` to examine their sign bits first. If the signs differ, the negative operand
 is smaller. If they agree, the subtraction's sign determines the ordering.
 The sign bit is bit 31 for `int` and bit 63 for `long`.
@@ -261,7 +261,7 @@ Writing and reading through a character pointer uses byte instructions:
     ldrb w0, [x9]       // Read one byte with zero extension; recover that character's bits.
 ```
 
-On Linux, plain `char` is unsigned. For macOS signed `char`, 4c tests bit 7 and
+On Linux, plain `char` is unsigned. For macOS signed `char`, 12c tests bit 7 and
 subtracts 256 when the byte represents a negative value. `_Bool` storage also
 uses one byte, with scalar assignments normalized to 0 or 1 first.
 
@@ -353,7 +353,7 @@ respect branch and literal-load reach.
 Internally, a double is a 64-bit pattern in `x0` or memory. Software routines
 unpack its sign, exponent and significand, compute with integers, and round the
 result. Those routines are C text in [src/softfloat.h](src/softfloat.h), compiled
-by 4c itself. They must pass the same instruction audit as the user program.
+by 12c itself. They must pass the same instruction audit as the user program.
 
 The Linux ABI still expects a double in a floating-point register at a call
 boundary. A memory round trip moves the bits without `FMOV`:

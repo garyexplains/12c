@@ -1,5 +1,5 @@
-#ifndef FOUR_C_STDARG_H
-#define FOUR_C_STDARG_H
+#ifndef TWELVE_C_STDARG_H
+#define TWELVE_C_STDARG_H
 /* The compiler represents va_list as a pointer to a private, 32-byte Linux
    AAPCS64 cursor. va_start and va_copy allocate independent cursor storage.
    The generated variadic prologue saves GP and FP registers separately. */

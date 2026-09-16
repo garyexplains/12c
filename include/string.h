@@ -1,4 +1,4 @@
-/* Controlled string declarations for 4c; implementations come from libc. */
+/* Controlled string declarations for 12c; implementations come from libc. */
 typedef unsigned long size_t;
 size_t strlen(const char *text);
 size_t strspn(const char *text, const char *accept);

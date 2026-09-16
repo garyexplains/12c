@@ -1,4 +1,4 @@
-# TODO: compile and run Dhrystone with 4c
+# TODO: compile and run Dhrystone with 12c
 
 The Linux Dhrystone goal is complete. The active goal and implementation plan
 are now in [SELF_HOSTING.md](SELF_HOSTING.md). The milestones below preserve the
@@ -7,14 +7,14 @@ have since been fixed as the first self-hosting prerequisite.
 
 ## Goal and completion criteria
 
-Compile the supplied modernised [Dhrystone source](examples/dhry.c) with 4c,
+Compile the supplied modernised [Dhrystone source](examples/dhry.c) with 12c,
 assemble and link against the target C library, and run it with correct final
 values and working timing/reporting. The benchmark source should not need to be
 rewritten to avoid unsupported language features.
 
-The system compiler may assemble/link 4c output. An explicit system-preprocessor
+The system compiler may assemble/link 12c output. An explicit system-preprocessor
 step is a possible implementation choice, but the benchmark's C code must be
-compiled by 4c. Start with native AArch64 Linux; validate macOS separately.
+compiled by 12c. Start with native AArch64 Linux; validate macOS separately.
 
 Preserve the project's 12-mnemonic restriction throughout. Successful parsing or
 assembly emission alone does not complete this goal.
@@ -22,9 +22,9 @@ assembly emission alone does not complete this goal.
 ## Current status
 
 The Linux unchanged-source milestone is complete: `make dhrystone` compiles
-`examples/dhry.c` with 4c, then assembles/links `build/dhry`. It runs with correct
+`examples/dhry.c` with 12c, then assembles/links `build/dhry`. It runs with correct
 final values and floating-point timing output. Software binary64 arithmetic is
-itself compiled by 4c and passes the same 12-mnemonic object audit.
+itself compiled by 12c and passes the same 12-mnemonic object audit.
 
 `make test-dhrystone` covers the retained fixed-iteration integer fixture,
 unchanged-source execution with the real clock, and unchanged-source execution
@@ -45,7 +45,7 @@ fixes now also cover record identity, union padding, nonzero boolean global
 initializers, narrow switch selectors, and extern-to-definition transitions.
 Native macOS ABI fixes remain deferred.
 
-The first milestone is implemented in [src/4c.c](src/4c.c):
+The first milestone is implemented in [src/12c.c](src/12c.c):
 
 - [x] File-scope and block-scope typedef aliases for supported types, including
   fixed-size arrays and void, with scope and name-conflict checks.
@@ -228,7 +228,7 @@ implementations come from libc as planned.
   lowering must be validated separately.
 
 Library implementations can come from libc; implementing these library functions
-inside 4c is unnecessary. First validate integer/string/pointer reporting and
+inside 12c is unnecessary. First validate integer/string/pointer reporting and
 64-bit clock/run-count handling without double formatting.
 
 ### 5. Implement floating-point timing and reporting

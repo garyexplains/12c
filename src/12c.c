@@ -10,7 +10,7 @@
 #include "softfloat.h"
 
 _Static_assert(sizeof(double) == 8 && FLT_RADIX == 2 && DBL_MANT_DIG == 53 &&
-               DBL_MAX_EXP == 1024, "4c requires a binary64 host double");
+               DBL_MAX_EXP == 1024, "12c requires a binary64 host double");
 
 #ifndef DEFAULT_INCLUDE_DIR
 #define DEFAULT_INCLUDE_DIR "include"
@@ -199,7 +199,7 @@ static size_t body_chars, current_function;
 
 static void fatal(const char *fmt, ...) {
     va_list ap;
-    fprintf(stderr, "4c: ");
+    fprintf(stderr, "12c: ");
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -830,8 +830,8 @@ static int identifier(const char *s) {
 
 static char *name(void) {
     if (!identifier(current()->text)) error("expected an identifier");
-    if (!compiling_softfloat && !strncmp(current()->text, "__4c_", 5))
-        error("identifier prefix __4c_ is reserved for compiler routines");
+    if (!compiling_softfloat && !strncmp(current()->text, "__12c_", 6))
+        error("identifier prefix __12c_ is reserved for compiler routines");
     return tokens[pos++].text;
 }
 
@@ -1786,7 +1786,7 @@ static Expr convert(Expr e, Type *to) {
             if (!integer(e.type)) error("double conversion requires an integer or double");
             if (!wide(e.type)) extend_reg(e.type, "w0", "x0");
             need_softfloat = 1;
-            emit("    bl .L__4c_sf_%s64\n", unsigned_type(e.type) ? "u" : "i");
+            emit("    bl .L__12c_sf_%s64\n", unsigned_type(e.type) ? "u" : "i");
         }
         return (Expr){to, 0, -1, 0};
     }
@@ -2638,7 +2638,7 @@ static Expr multiplicative(void) {
             emit("    ldr x1, [sp]\n    add sp, sp, #16\n");
             literal_reg("w2", !star);
             need_softfloat = 1;
-            emit("    bl .L__4c_sf_binary\n");
+            emit("    bl .L__12c_sf_binary\n");
             e = (Expr){&double_type, 0, -1, 0};
             continue;
         }
@@ -3101,7 +3101,7 @@ static void block(int function_body) {
                     if (type->kind == TY_VOID) error("object cannot have void type");
                     size_t g = nglobals++;
                     char buffer[64];
-                    snprintf(buffer, sizeof(buffer), "__4c_static_%zu", g);
+                    snprintf(buffer, sizeof(buffer), "__12c_static_%zu", g);
                     globals[g] = (Local){copy(buffer, strlen(buffer)), 0, type, 1, 0};
                     global_static[g] = 1;
                     locals[nlocals++] = (Local){s, -4, type, 1, (int)g};
@@ -3592,7 +3592,7 @@ static void parse(void) {
                 memcpy(end, softfloat_source[i], n); end += n;
             }
             *end = 0;
-            lex_source("<4c software binary64>", source, 0);
+            lex_source("<12c software binary64>", source, 0);
         }
         if (!strcmp(current()->text, "_Static_assert")) {
             ++pos;
@@ -3802,12 +3802,12 @@ static void parse(void) {
     if (need_softfloat) {
         /* One-bit unsigned shift, synthesized from bit tests and shifted ADD.
            This primitive is private to the software routines; it is not C >>. */
-        fprintf(program, ".text\n.p2align 2\n.type .L__4c_sf_shr1, %%function\n.L__4c_sf_shr1:\n"
+        fprintf(program, ".text\n.p2align 2\n.type .L__12c_sf_shr1, %%function\n.L__12c_sf_shr1:\n"
                          "    sub x9, x9, x9\n    sub x10, x10, x10\n    add x10, x10, #1\n");
         for (int bit = 1; bit < 64; ++bit)
             fprintf(program, "    tbz x0, #%d, .Lsf_shift%d\n    add x9, x9, x10, lsl #%d\n.Lsf_shift%d:\n",
                     bit, bit, bit - 1, bit);
-        fprintf(program, "    sub x0, x9, xzr\n    ret\n.size .L__4c_sf_shr1, .-.L__4c_sf_shr1\n");
+        fprintf(program, "    sub x0, x9, xzr\n    ret\n.size .L__12c_sf_shr1, .-.L__12c_sf_shr1\n");
     }
     for (size_t i = 0; i < nglobals; ++i) {
         Local *g = &globals[i];
@@ -3885,7 +3885,7 @@ int main(int argc, char **argv) {
 #endif
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--help")) {
-            puts("usage: 4c [--target linux|macos] [-I directory] [-o output.s] input.c");
+            puts("usage: 12c [--target linux|macos] [-I directory] [-o output.s] input.c");
             return 0;
         }
         if (!strcmp(argv[i], "--target")) {

@@ -1,4 +1,4 @@
-# A tiny C compiler for AArch64
+# 12c: a tiny C compiler using twelve AArch64 instructions
 
 This project will compile a subset of C into native AArch64 code using just
 **12 instruction mnemonics**. Generated programs will use the system assembler,
@@ -28,7 +28,7 @@ and running the result requires an AArch64 system toolchain and C runtime.
 
 ```sh
 make
-./build/4c examples/hello.c -o build/hello.s
+./build/12c examples/hello.c -o build/hello.s
 cc build/hello.s -o build/hello
 ./build/hello
 make test
@@ -55,7 +55,7 @@ On a Linux host, the default target is Linux. On a Mac, it is macOS. Select a
 target explicitly with `--target linux` or `--target macos`:
 
 ```sh
-./build/4c --target macos examples/hello.c -o build/hello-macos.s
+./build/12c --target macos examples/hello.c -o build/hello-macos.s
 ```
 
 Cross-target assembly emission does not supply a cross-linker or target SDK.
@@ -315,9 +315,9 @@ make dhrystone
 make test-dhrystone
 ```
 
-`make dhrystone` runs 4c on `examples/dhry.c`, then uses the system compiler only
+`make dhrystone` runs 12c on `examples/dhry.c`, then uses the system compiler only
 to assemble/link `build/dhry.s`. Binary64 routines are embedded source compiled
-by 4c and included in the emitted assembly; no system-compiled arithmetic helper
+by 12c and included in the emitted assembly; no system-compiled arithmetic helper
 is linked. The source file is unchanged. The benchmark increases the iteration
 count until a measurement takes at least two seconds of process CPU time.
 Its final array counter includes iterations from every attempt, so its printed
@@ -388,7 +388,7 @@ other host architectures. Set `TEST_CC` to override the test linker driver.
 The arithmetic example also prints `A`:
 
 ```sh
-./build/4c examples/arithmetic.c -o build/arithmetic.s
+./build/12c examples/arithmetic.c -o build/arithmetic.s
 cc build/arithmetic.s -o build/arithmetic
 ./build/arithmetic
 ```
@@ -396,7 +396,7 @@ cc build/arithmetic.s -o build/arithmetic
 The control-flow example prints `A` through `Z` followed by a newline:
 
 ```sh
-./build/4c examples/alphabet.c -o build/alphabet.s
+./build/12c examples/alphabet.c -o build/alphabet.s
 cc build/alphabet.s -o build/alphabet
 ./build/alphabet
 ```
@@ -404,7 +404,7 @@ cc build/alphabet.s -o build/alphabet
 The recursive example computes `sum(10) + 10` and prints `A`:
 
 ```sh
-./build/4c examples/recursion.c -o build/recursion.s
+./build/12c examples/recursion.c -o build/recursion.s
 cc build/recursion.s -o build/recursion
 ./build/recursion
 ```
@@ -412,7 +412,7 @@ cc build/recursion.s -o build/recursion
 The string-walking example prints `Hello, Jetson!`:
 
 ```sh
-./build/4c examples/strings.c -o build/strings.s
+./build/12c examples/strings.c -o build/strings.s
 cc build/strings.s -o build/strings
 ./build/strings
 ```
@@ -601,7 +601,7 @@ Platform details include:
 Linux double transport uses `LDR Dn` and `STR Dn` without increasing the mnemonic
 count. The allowed forms use `d0` through `d7` with stack/frame addresses and
 immediate offsets. Internal values remain integer-register bit patterns; software
-arithmetic is compiled by 4c under the same whitelist. `float`, aggregate
+arithmetic is compiled by 12c under the same whitelist. `float`, aggregate
 arguments, additional double operations and full C ABI coverage remain separate
 work.
 

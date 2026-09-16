@@ -1,4 +1,4 @@
-/* System-compiled oracle. No part of this file supplies arithmetic to 4c. */
+/* System-compiled oracle. No part of this file supplies arithmetic to 12c. */
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>

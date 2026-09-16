@@ -13,7 +13,7 @@ import unittest
 from dhrystone_support import integer_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPILER = Path(os.environ.get("TEST_COMPILER", ROOT / "build" / "4c"))
+COMPILER = Path(os.environ.get("TEST_COMPILER", ROOT / "build" / "12c"))
 ALLOWED = {"ldr", "str", "ldrb", "strb", "add", "sub", "cbz", "tbz",
            "bl", "blr", "ret", "adrp"}
 NATIVE = platform.machine().lower() in {"aarch64", "arm64"}
@@ -27,7 +27,7 @@ def run(args, **kwargs):
 
 class CompilerTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="4c-test-")
+        self.temp = tempfile.TemporaryDirectory(prefix="12c-test-")
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
 
@@ -207,7 +207,7 @@ class CompilerTests(unittest.TestCase):
 
     @unittest.skipUnless(NATIVE and TARGET == "linux", "requires native AArch64 Linux")
     def test_dhrystone_unchanged_deterministic_timing(self):
-        # Only clock is controlled; 4c compiles the original file including all
+        # Only clock is controlled; 12c compiles the original file including all
         # double formulas. System C supplies an independent reference executable.
         source = (ROOT / "examples/dhry.c").read_text()
         asm = self.successful(source)
@@ -246,12 +246,12 @@ class CompilerTests(unittest.TestCase):
                  "int main(){double x=1.0+2.0;return 0;}",
                  "int main(){return 1.0<2.0;}",
                  "int main(){double x=1.0;++x;return 0;}",
-                 "int __4c_sf_shr1; int main(){return 0;}")
+                 "int __12c_sf_shr1; int main(){return 0;}")
         for source in cases:
             with self.subTest(source=source):
                 result, _ = self.compile(source, target="linux")
                 self.assertGreater(result.returncode, 0)
-                self.assertIn(b"4c:", result.stderr)
+                self.assertIn(b"12c:", result.stderr)
         result, _ = self.compile("int main(){double x=1.5;return 0;}", target="macos")
         self.assertGreater(result.returncode, 0)
         self.assertIn(b"Linux target", result.stderr)
@@ -403,7 +403,7 @@ class CompilerTests(unittest.TestCase):
                     # A documented resource limit is fine; memory corruption,
                     # sanitizer errors and unrelated diagnostics are not.
                     self.assertRegex(result.stderr.decode(),
-                                     r"4c:.*(?:nesting|too many.*switch)")
+                                     r"12c:.*(?:nesting|too many.*switch)")
                 elif NATIVE:
                     self.execute(source)
 
