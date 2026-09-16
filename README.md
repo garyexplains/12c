@@ -71,8 +71,9 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
 ### Currently supported language
 
 - One `int main()` or `int main(void)` definition, without parameters.
-- Types: 32-bit `int` and `unsigned`, 64-bit `long` and `unsigned long`, 8-bit
-  `char`, 8-bit `_Bool`, and 64-bit pointers, including pointers to pointers.
+- Types: 32-bit `int` and `unsigned`, 64-bit `long` and `unsigned long`, 16-bit
+  `short` and `unsigned short`, distinct 8-bit `char`, `signed char` and
+  `unsigned char`, 8-bit `_Bool`, and 64-bit pointers, including pointers to pointers.
   Plain `char` is unsigned on AArch64 Linux and signed on macOS, following
   each target's default ABI. Character expressions promote to `int`. `_Bool`
   storage normalizes every nonzero scalar value to 1 and zero to 0.
@@ -100,9 +101,10 @@ working directory. Rebuild or supply `-I` if the checkout is moved.
   as `struct Tag` after their definition. Member access uses `.` on record
   lvalues and `->` through pointers, preserving lvalues so member addresses
   and members of array rows work. Aggregate assignment copies byte by byte,
-  including self-assignment; aggregates are not supported as parameters,
-  results, or global initializers, and member offsets must fit a 12-bit
-  immediate. Anonymous records and unions nested in members are supported.
+  including self-assignment. Linux aggregate arguments and results follow the
+  ABI described below; global aggregate initializers are supported. Member
+  offsets must fit a 12-bit immediate. Anonymous records and unions nested in
+  members are supported.
 - `sizeof(type)` yields the type's size as an `unsigned long` without
   runtime evaluation; the parenthesized form takes a type (specifiers and
   `*` forms), not an expression.
@@ -265,6 +267,14 @@ the existing limit remains eight total arguments. Callees save incoming
 parameters in their frames before executing the body. Results are returned in
 `w0` for 32-bit integers, `x0` for 64-bit integers/pointers, and `d0` for doubles. Character and `_Bool`
 arguments and results are narrowed and extended according to the target.
+Linux structs and unions up to 16 bytes use general-purpose registers when
+available; larger objects are passed by pointer to a private copy. Homogeneous
+aggregates of up to four doubles use floating-point registers, including for
+results. Arguments that exhaust their register bank use stack storage. Large
+nonhomogeneous results use the caller's buffer address in `x8`.
+Variadic definitions keep separate GP/FP save areas; `va_start` and `va_copy`
+each create an independent cursor. Exact 16-bit loads/stores are synthesized
+from byte instructions to preserve the twelve-mnemonic restriction.
 These conventions permit calls
 between generated and system-compiled C.
 Only `main` has C's implicit zero return guarantee; other functions should

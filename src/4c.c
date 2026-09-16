@@ -24,10 +24,11 @@ typedef struct {
     int line;
     const char *source;
     uint64_t hidden_macros[2]; /* Macros disabled while rescanning this token. */
+    int space_before; /* Preserve whitespace through macro argument prescan. */
 } Token;
 
 typedef enum { TY_BOOL, TY_CHAR, TY_INT, TY_UINT, TY_LONG, TY_ULONG, TY_DOUBLE,
-                TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_VOID } TypeKind;
+                TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_VOID, TY_SCHAR, TY_UCHAR, TY_SHORT, TY_USHORT } TypeKind;
 typedef struct Member Member;
 typedef struct Type {
     TypeKind kind;
@@ -50,11 +51,16 @@ static Type bool_type = {TY_BOOL, NULL, 1, 1, NULL, 0},
 static Type long_type = {TY_LONG, NULL, 8, 8, NULL, 0},
             ulong_type = {TY_ULONG, NULL, 8, 8, NULL, 0};
 static Type double_type = {TY_DOUBLE, NULL, 8, 8, NULL, 0};
+static Type schar_type = {TY_SCHAR, NULL, 1, 1, NULL, 0};
+static Type uchar_type = {TY_UCHAR, NULL, 1, 1, NULL, 0};
+static Type short_type = {TY_SHORT, NULL, 2, 2, NULL, 0};
+static Type ushort_type = {TY_USHORT, NULL, 2, 2, NULL, 0};
 static int need_softfloat, compiling_softfloat;
 static int alignment(Type *t) {
     switch (t->kind) {
     case TY_PTR: case TY_LONG: case TY_ULONG: case TY_DOUBLE: return 8;
     case TY_INT: case TY_UINT: return 4;
+    case TY_SHORT: case TY_USHORT: return 2;
     case TY_ARRAY: return alignment(t->base);
     case TY_STRUCT: case TY_UNION: return t->align;
     default: return 1; /* TY_BOOL, TY_CHAR, TY_VOID */
@@ -165,7 +171,7 @@ static int type_start(void) {
     const char *s = current()->text;
     return !strcmp(s, "int") || !strcmp(s, "char") ||
            !strcmp(s, "void") || !strcmp(s, "_Bool") ||
-           !strcmp(s, "long") || !strcmp(s, "unsigned") ||
+           !strcmp(s, "long") || !strcmp(s, "short") || !strcmp(s, "signed") || !strcmp(s, "unsigned") ||
            !strcmp(s, "enum") || !strcmp(s, "struct") ||
            !strcmp(s, "union") || !strcmp(s, "const") || !strcmp(s, "double") || alias_type(s) != NULL;
 }
@@ -177,7 +183,6 @@ typedef struct {
     int internal;
     int static_linkage;
     int va_save_offset;   /* offset of x0..x7 save area from x29 (variadic only) */
-    int va_tag_offset;    /* offset of __va_list_tag from x29 (variadic only) */
     int fp_save_offset;   /* offset of d0..d7 save area from x29 (variadic only) */
     int result_ptr_offset; /* frame slot for the x8 indirect result (big aggregates) */
     Type *result;
@@ -220,7 +225,9 @@ static void token(const char *s, size_t len, const char *file, int line) {
         capacity = capacity ? capacity * 2 : 128;
         tokens = resize(tokens, capacity * sizeof(*tokens));
     }
-    tokens[ntokens++] = (Token){copy(s, len), file, line, s, {0, 0}};
+    int space = ntokens && (tokens[ntokens-1].file != file ||
+                tokens[ntokens-1].source + strlen(tokens[ntokens-1].text) != s);
+    tokens[ntokens++] = (Token){copy(s, len), file, line, s, {0, 0}, space};
 }
 
 static char *read_file(const char *path) {
@@ -350,6 +357,50 @@ static int macro_defined(const char *name) {
         if (!strcmp(macros[k].name, name)) return 1;
     return 0;
 }
+/* Stringify token spellings, not source spans: expanded arguments can contain
+   tokens originating in several different macro definitions. */
+static char *stringify_argument(Token **args, size_t *lengths, int first, int end) {
+    size_t capacity = 3;
+    for (int p = first; p < end; ++p) {
+        capacity += 2;
+        for (size_t q = 0; q < lengths[p]; ++q) capacity += 2 * strlen(args[p][q].text) + 1;
+    }
+    char *text = resize(NULL, capacity);
+    size_t used = 0;
+    text[used++] = '"';
+    for (int p = first; p < end; ++p) {
+        for (int q = p > first ? -1 : 0; q < (int)lengths[p]; ++q) {
+            Token *t = &args[p][q];
+            if (used > 1 && t->space_before) text[used++] = ' ';
+            for (const char *r = t->text; *r; ++r) {
+                if (*r == '"' || *r == '\\') text[used++] = '\\';
+                text[used++] = *r;
+            }
+        }
+    }
+    text[used++] = '"';
+    text[used] = 0;
+    return text;
+}
+static void preprocess(void);
+static int argument_expansion_depth;
+/* Expand arguments before disabling the outer macro. Keep the original tokens
+   for # and ##, which deliberately suppress this prescan. */
+static Token *expanded_argument(Token *argument, size_t length, size_t *result_length) {
+    if (++argument_expansion_depth > 128) fatal("macro argument nesting limit exceeded");
+    Token *saved = tokens;
+    size_t saved_count = ntokens, saved_capacity = capacity;
+    tokens = resize(NULL, (length + 1) * sizeof(Token));
+    for (size_t i = 0; i < length; ++i) tokens[i] = argument[i];
+    tokens[length] = (Token){"<eof>", "<macro argument>", 1, "", {0, 0}, 0};
+    ntokens = length + 1; capacity = ntokens;
+    preprocess();
+    Token *result = tokens;
+    *result_length = ntokens - 1;
+    tokens = saved; ntokens = saved_count; capacity = saved_capacity;
+    --argument_expansion_depth;
+    return result;
+}
 /* Expand in source order. Replacement tokens inherit a hide set, preventing
    self/mutual recursion while still allowing rescanning of nested macros. */
 static void preprocess(void) {
@@ -434,8 +485,21 @@ static void preprocess(void) {
                 fatal("%s:%d: macro expansion limit exceeded", tokens[i].file, tokens[i].line);
             /* Build the replacement token stream, substituting parameters and
                handling #x stringification and __VA_ARGS__. */
+            Token **expanded = resize(NULL, (nargs + 1) * sizeof(Token *));
+            size_t *expanded_len = resize(NULL, (nargs + 1) * sizeof(size_t));
+            for (int p = 0; p < nargs; ++p) { expanded[p] = NULL; expanded_len[p] = 0; }
+            for (size_t j = 0; j < m->nbody; ++j) {
+                if ((j && (!strcmp(m->body[j-1].text, "#") || !strcmp(m->body[j-1].text, "##"))) ||
+                    (j + 1 < m->nbody && !strcmp(m->body[j+1].text, "##"))) continue;
+                for (int p = 0; p < nargs; ++p) {
+                    const char *param = p < m->nparams ? m->params[p] : "__VA_ARGS__";
+                    if (!strcmp(param, m->body[j].text) && !expanded[p])
+                        expanded[p] = expanded_argument(args[p], args_len[p], &expanded_len[p]);
+                }
+            }
             size_t argument_tokens = 1;
-            for (int p = 0; p < nargs; ++p) argument_tokens += args_len[p];
+            for (int p = 0; p < nargs; ++p)
+                argument_tokens += args_len[p] + expanded_len[p] + 1;
             if (m->nbody && argument_tokens > 100000 / m->nbody)
                 fatal("macro replacement exceeds token limit");
             size_t replacement_capacity = m->nbody ? m->nbody * argument_tokens : 1;
@@ -455,33 +519,11 @@ static void preprocess(void) {
                             if (!strcmp(nxt->text, m->params[pi])) { p = pi; break; }
                     }
                     if (p >= 0 && p < actual_args) {
-                        /* Build a string literal from the argument source range.
-                           Use [first.source, last.source + last.text_len) so
-                           whitespace between tokens is preserved. For
-                           __VA_ARGS__ the range spans every variadic slice,
-                           including the original commas. */
-                        const char *first = args[p][0].source;
-                        Token *last;
-                        if (!strcmp(nxt->text, "__VA_ARGS__") && m->variadic)
-                            last = &args[nargs - 1][args_len[nargs - 1] - 1];
-                        else
-                            last = &args[p][args_len[p] - 1];
-                        size_t src_len = strlen(last->text);
-                        const char *end = last->source + src_len;
-                        size_t total = 2; /* surrounding quotes */
-                        for (const char *r = first; r < end; ++r)
-                            total += (*r == '"' || *r == '\\') ? 2 : 1;
-                        char *lit = resize(NULL, total + 1);
-                        size_t pos = 0;
-                        lit[pos++] = '"';
-                        for (const char *r = first; r < end; ++r) {
-                            if (*r == '"' || *r == '\\') lit[pos++] = '\\';
-                            lit[pos++] = *r;
-                        }
-                        lit[pos++] = '"';
-                        lit[pos] = 0;
+                        int last = !strcmp(nxt->text, "__VA_ARGS__") && m->variadic ? nargs : p + 1;
+                        char *lit = stringify_argument(args, args_len, p, last);
                         replacement[rlen] = *nxt;
                         replacement[rlen].text = lit;
+                        replacement[rlen].source = lit;
                         for (int word = 0; word < 2; ++word)
                             replacement[rlen].hidden_macros[word] |= tokens[i].hidden_macros[word];
                         replacement[rlen].hidden_macros[k / 64] |= UINT64_C(1) << (k % 64);
@@ -502,8 +544,10 @@ static void preprocess(void) {
                             replacement[rlen].hidden_macros[k / 64] |= UINT64_C(1) << (k % 64);
                             ++rlen;
                         }
-                        for (size_t q = 0; q < args_len[s]; ++q) {
-                            replacement[rlen] = args[s][q];
+                        Token *part = expanded[s] ? expanded[s] : args[s];
+                        size_t part_len = expanded[s] ? expanded_len[s] : args_len[s];
+                        for (size_t q = 0; q < part_len; ++q) {
+                            replacement[rlen] = part[q];
                             for (int word = 0; word < 2; ++word)
                                 replacement[rlen].hidden_macros[word] |= tokens[i].hidden_macros[word];
                             replacement[rlen].hidden_macros[k / 64] |= UINT64_C(1) << (k % 64);
@@ -517,8 +561,13 @@ static void preprocess(void) {
                 for (int pi = 0; pi < m->nparams; ++pi)
                     if (!strcmp(t->text, m->params[pi])) { p = pi; break; }
                 if (p >= 0) {
-                    for (size_t q = 0; q < args_len[p]; ++q) {
-                        replacement[rlen] = args[p][q];
+                    int paste = (j && !strcmp(m->body[j-1].text, "##")) ||
+                                (j + 1 < m->nbody && !strcmp(m->body[j+1].text, "##"));
+                    Token *part = !paste && expanded[p] ? expanded[p] : args[p];
+                    size_t part_len = !paste && expanded[p] ? expanded_len[p] : args_len[p];
+                    for (size_t q = 0; q < part_len; ++q) {
+                        replacement[rlen] = part[q];
+                        if (!q) replacement[rlen].space_before = t->space_before;
                         for (int word = 0; word < 2; ++word)
                             replacement[rlen].hidden_macros[word] |= tokens[i].hidden_macros[word];
                         replacement[rlen].hidden_macros[k / 64] |= UINT64_C(1) << (k % 64);
@@ -557,36 +606,9 @@ static void preprocess(void) {
                 rlen -= 2;
                 --q;
             }
-            /* Stringification needs the source range; splice would invalidate source
-               pointers into the freed tokens array, so capture the text first. */
-            int needs_stringification = 0;
-            for (size_t q = 0; q < m->nbody; ++q)
-                if (!strcmp(m->body[q].text, "#")) needs_stringification = 1;
-            if (needs_stringification) {
-                for (int p = 0; p < nargs; ++p) {
-                    if (args[p] && args[p]->source) {
-                        Token *last = &args[p][args_len[p] - 1];
-                        size_t src_len = strlen(last->text);
-                        size_t total = (size_t)((last->source + src_len) - args[p]->source);
-                        char *buf = resize(NULL, total + 1);
-                        memcpy(buf, args[p]->source, total);
-                        buf[total] = 0;
-                        Token *tk = resize(NULL, args_len[p] * sizeof(Token));
-                        for (size_t q = 0; q < args_len[p]; ++q) {
-                            tk[q] = args[p][q];
-                            tk[q].text = copy(args[p][q].text, strlen(args[p][q].text));
-                            const char *orig_src = args[p][q].source;
-                            if (orig_src >= args[p]->source &&
-                                orig_src <= last->source + src_len) {
-                                tk[q].source = buf + (orig_src - args[p]->source);
-                            } else {
-                                tk[q].source = copy(orig_src, strlen(orig_src));
-                            }
-                        }
-                        args[p] = tk;
-                    }
-                }
-            }
+            for (int p = 0; p < nargs; ++p) free(expanded[p]);
+            free(expanded);
+            free(expanded_len);
             splice_tokens(i, consumed, replacement, rlen);
             free(replacement);
             free(args);
@@ -859,7 +881,7 @@ static void layout_record(Type *t, int is_union) {
 }
 static int integer(Type *t) {
     switch (t->kind) {
-    case TY_BOOL: case TY_CHAR: case TY_INT: case TY_UINT:
+    case TY_BOOL: case TY_CHAR: case TY_SCHAR: case TY_UCHAR: case TY_SHORT: case TY_USHORT: case TY_INT: case TY_UINT:
     case TY_LONG: case TY_ULONG: return 1;
     default: return 0;
     }
@@ -871,15 +893,50 @@ static int wide(Type *t) {
 static int aggregate(Type *t) {
     return t->kind == TY_STRUCT || t->kind == TY_UNION;
 }
-/* How many GP registers an aggregate argument consumes under AAPCS64:
-   1 (size <= 8), 2 (size <= 16), or 0 (larger: copied to the stack). */
-static int aggregate_slots(Type *t) {
-    if (t->size <= 8) return 1;
-    if (t->size <= 16) return 2;
-    return 0;
+/* Homogeneous double aggregates use consecutive FP registers, including
+   nested records/arrays. Other aggregates larger than 16 bytes travel by
+   pointer to a caller-owned copy. */
+static int hfa_count(Type *t) {
+    if (t->kind == TY_DOUBLE) return 1;
+    if (t->kind == TY_ARRAY) {
+        int n = hfa_count(t->base);
+        if (!n || !t->base->size) return 0;
+        n *= t->size / t->base->size;
+        return n <= 4 ? n : 0;
+    }
+    if (!aggregate(t)) return 0;
+    int count = 0;
+    for (int i = 0; i < t->nmembers; ++i) {
+        int n = hfa_count(t->members[i].type);
+        if (!n) return 0;
+        if (t->kind == TY_UNION) { if (n > count) count = n; }
+        else count += n;
+    }
+    return count <= 4 && t->size == count * 8 ? count : 0;
+}
+static int indirect_aggregate(Type *t) {
+    return aggregate(t) && t->size > 16 && !hfa_count(t);
+}
+typedef struct { int gp, fp, stack, count, indirect; } ArgPlace;
+static ArgPlace argument_place(Type *t, int *gp, int *fp, int *stack) {
+    ArgPlace p = {-1, -1, -1, 1, indirect_aggregate(t)};
+    int hfa = hfa_count(t);
+    int bytes = p.indirect ? 8 : (t->size + 7) & ~7;
+    if (hfa) {
+        p.count = hfa;
+        if (*fp + hfa <= 8) { p.fp = *fp; *fp += hfa; return p; }
+        *fp = 8;
+    } else {
+        p.count = aggregate(t) && !p.indirect ? (t->size + 7) / 8 : 1;
+        if (*gp + p.count <= 8) { p.gp = *gp; *gp += p.count; return p; }
+        *gp = 8;
+    }
+    p.stack = *stack;
+    *stack += bytes;
+    return p;
 }
 static int unsigned_type(Type *t) {
-    return t->kind == TY_UINT || t->kind == TY_ULONG ||
+    return t->kind == TY_UINT || t->kind == TY_ULONG || t->kind == TY_UCHAR || t->kind == TY_USHORT ||
            (t->kind == TY_CHAR && !macos);
 }
 /* Usual arithmetic conversions for the supported integer types. */
@@ -890,7 +947,7 @@ static Type *common_integer(Type *a, Type *b) {
     return &int_type;
 }
 static Type *promote(Type *t) {
-    if (t->kind == TY_BOOL || t->kind == TY_CHAR) return &int_type;
+    if (integer(t) && t->size < 4) return &int_type;
     return t;
 }
 typedef struct { uint64_t value; Type *type; } IntConst;
@@ -1106,6 +1163,13 @@ static Type *parse_specs(void) {
     while (take("const")) {}
     if (take("int")) t = &int_type;
     else if (take("char")) t = &char_type;
+    else if (take("short")) { take("int"); t = &short_type; }
+    else if (take("signed")) {
+        if (take("char")) t = &schar_type;
+        else if (take("short")) { take("int"); t = &short_type; }
+        else if (take("long")) { take("long"); take("int"); t = &long_type; }
+        else { take("int"); t = &int_type; }
+    }
     else if (take("void")) t = &void_type;
     else if (take("_Bool")) t = &bool_type;
     else if (take("double")) {
@@ -1122,7 +1186,8 @@ static Type *parse_specs(void) {
         else t = &long_type;
         take("int");
     } else if (take("unsigned")) {
-        if (take("char")) t = &char_type;
+        if (take("char")) t = &uchar_type;
+        else if (take("short")) { take("int"); t = &ushort_type; }
         else if (take("long")) {
             if (take("long")) t = &ulong_type;
             else t = &ulong_type;
@@ -1397,7 +1462,7 @@ static size_t parse_one_initializer(Type *t, InitEntry *out, size_t out_max) {
             IntConst c = int_literal();
             uint64_t v = (uint64_t)(-(int64_t)c.value);
             if (t->kind == TY_BOOL) v = v != 0;
-            out[0] = (InitEntry){v, c.type, 0};
+            out[0] = (InitEntry){v, t, 0};
         }
         return 1;
     }
@@ -1415,7 +1480,7 @@ static size_t parse_one_initializer(Type *t, InitEntry *out, size_t out_max) {
             out[0] = (InitEntry){double_bits(value), &double_type, 0};
         } else {
             IntConst c = int_literal();
-            out[0] = (InitEntry){c.value, c.type, 0};
+            out[0] = (InitEntry){c.value, t, 0};
         }
         return 1;
     }
@@ -1442,21 +1507,21 @@ static size_t parse_one_initializer(Type *t, InitEntry *out, size_t out_max) {
         IntConst c = int_literal();
         /* Choose a target type if t is unknown: prefer narrower. */
         if (t->kind == TY_BOOL) {
-            out[0] = (InitEntry){c.value != 0, &int_type, 0};
+            out[0] = (InitEntry){c.value != 0, t, 0};
             return 1;
         }
         if (t->kind == TY_CHAR) {
-            out[0] = (InitEntry){c.value & 0xFF, &char_type, 0};
+            out[0] = (InitEntry){c.value & 0xFF, t, 0};
             return 1;
         }
-        out[0] = (InitEntry){c.value, c.type, 0};
+        out[0] = (InitEntry){c.value, t, 0};
         return 1;
     }
     /* Enum constant or zero identifier. */
     if (!strcmp(current()->text, "0") || !strcmp(current()->text, "0L") ||
         !strcmp(current()->text, "0UL")) {
-        IntConst c = int_literal();
-        out[0] = (InitEntry){0, c.type, 0};
+        int_literal();
+        out[0] = (InitEntry){0, t, 0};
         return 1;
     }
     if (isalpha((unsigned char)current()->text[0]) || current()->text[0] == '_') {
@@ -1569,10 +1634,12 @@ static void emit_init_entry(InitEntry e) {
         } else {
             fprintf(program, "    .quad %llu\n", (unsigned long long)e.value);
         }
-    } else if (t->kind == TY_INT || t->kind == TY_UINT || t->kind == TY_BOOL) {
+    } else if (t->kind == TY_INT || t->kind == TY_UINT) {
         fprintf(program, "    .word %llu\n",
                 (unsigned long long)(int32_t)e.value);
-    } else if (t->kind == TY_CHAR) {
+    } else if (t->size == 2) {
+        fprintf(program, "    .hword %u\n", (unsigned)(e.value & 65535));
+    } else if (t->size == 1) {
         fprintf(program, "    .byte %llu\n", (unsigned long long)(e.value & 0xFF));
     } else {
         fprintf(program, "    .word %llu\n", (unsigned long long)e.value);
@@ -1650,17 +1717,24 @@ static void literal64_to(const char *xreg, uint64_t value) {
 static Expr expression(void);
 static Expr assignment_expr(void);
 static Expr unary(void);
+/* Load short integers with bytes so the twelve-mnemonic vocabulary is kept. */
+static void load_small(Type *t, const char *addr, int reg) {
+    if (t->size == 2) emit("    ldrb w13, [%s, #1]\n", addr);
+    emit("    ldrb w%d, [%s]\n", reg, addr);
+    if (t->size == 2) emit("    add w%d, w%d, w13, lsl #8\n", reg, reg);
+    if (t->kind != TY_BOOL && !unsigned_type(t)) {
+        size_t id = next_label++;
+        emit("    tbz w%d, #%d, .Lchar%zu\n", reg, t->size * 8 - 1, id);
+        if (t->size == 1) emit("    sub w%d, w%d, #256\n", reg, reg);
+        else emit("    sub w%d, w%d, #16, lsl #12\n", reg, reg);
+        emit(".Lchar%zu:\n", id);
+    }
+}
 /* Load a value from the address held in the given register into w9/x9. */
 static void load_value_reg(Type *t, const char *addr) {
     if (wide(t)) emit("    ldr x9, [%s]\n", addr);
     else if (t->kind == TY_INT || t->kind == TY_UINT) emit("    ldr w9, [%s]\n", addr);
-    else {
-        emit("    ldrb w9, [%s]\n", addr);
-        if (macos && t->kind == TY_CHAR) {
-            size_t id = next_label++;
-            emit("    tbz w9, #7, .Lc9%zu\n    sub w9, w9, #256\n.Lc9%zu:\n", id, id);
-        }
-    }
+    else load_small(t, addr, 9);
 }
 static Expr value(Expr e) {
     if (e.type->kind == TY_VOID) error("void expression has no value");
@@ -1674,13 +1748,7 @@ static Expr value(Expr e) {
         if (wide(e.type)) emit("    ldr x0, [x0]\n");
         else if (e.type->kind == TY_INT || e.type->kind == TY_UINT)
             emit("    ldr w0, [x0]\n");
-        else { /* TY_CHAR and TY_BOOL load as one byte */
-            emit("    ldrb w0, [x0]\n");
-            if (macos && e.type->kind == TY_CHAR) {
-                size_t id = next_label++;
-                emit("    tbz w0, #7, .Lchar%zu\n    sub w0, w0, #256\n.Lchar%zu:\n", id, id);
-            }
-        }
+        else load_small(e.type, "x0", 0);
     }
     e.lvalue = 0;
     e.local = -1;
@@ -1691,12 +1759,10 @@ static Expr condition_value(Expr e) {
     if (e.type->kind == TY_DOUBLE) emit("    add x0, x0, x0\n");
     return e;
 }
-static void narrow_char(void) {
-    emit("    sub sp, sp, #16\n    strb w0, [sp]\n    ldrb w0, [sp]\n    add sp, sp, #16\n");
-    if (macos) {
-        size_t id = next_label++;
-        emit("    tbz w0, #7, .Lchar%zu\n    sub w0, w0, #256\n.Lchar%zu:\n", id, id);
-    }
+static void narrow_integer(Type *t) {
+    emit("    sub sp, sp, #16\n    str w0, [sp]\n");
+    load_small(t, "sp", 0);
+    emit("    add sp, sp, #16\n");
 }
 /* Normalize any scalar value in x0/w0 to exactly 0 or 1 for _Bool. */
 static void normalize_bool(Type *from) {
@@ -1746,7 +1812,7 @@ static Expr convert(Expr e, Type *to) {
     }
     if (e.type->kind == TY_DOUBLE) error("double-to-integer conversion is not supported yet");
     if (!integer(e.type)) error("cannot convert pointer to integer");
-    if (to->kind == TY_CHAR) narrow_char();
+    if (integer(to) && to->size < 4) narrow_integer(to);
     else if (to->kind == TY_LONG || to->kind == TY_ULONG) {
         if (!wide(e.type)) extend_reg(e.type, "w0", "x0");
     }
@@ -1776,9 +1842,11 @@ static void store_value(Type *t, const char *address) {
         copy_object(t, address, "x0");
         return;
     }
-    emit("    %s %s0, [%s]\n",
-         t->kind == TY_CHAR || t->kind == TY_BOOL ? "strb" : "str",
-         wide(t) ? "x" : "w", address);
+    if (t->size == 2) {
+        emit("    sub sp, sp, #16\n    str w0, [sp]\n    ldrb w13, [sp, #1]\n    add sp, sp, #16\n");
+        emit("    strb w0, [%s]\n    strb w13, [%s, #1]\n", address, address);
+    } else emit("    %s %s0, [%s]\n", t->size == 1 ? "strb" : "str", wide(t) ? "x" : "w", address);
+
 }
 static String decode_literal(void) {
     const unsigned char *p = (unsigned char *)current()->text + 1;
@@ -1848,12 +1916,8 @@ static Expr string_literal(void) {
 static void parse_compound_inner(Type *t, const char *addr) {
     Expr e = expression();
     convert(e, t);
-    if (wide(t)) emit("    str x0, [%s]\n", addr);
-    else if (t->kind == TY_INT || t->kind == TY_UINT || t->kind == TY_BOOL)
-        emit("    str w0, [%s]\n", addr);
-    else if (t->kind == TY_CHAR)
-        emit("    strb w0, [%s]\n", addr);
-    else emit("    str x0, [%s]\n", addr);
+    emit("    add x9, %s\n", addr);
+    store_value(t, "x9");
 }
 static Expr primary(void) {
     /* va_start(ap, last), va_end(ap), va_copy(dest, src) are syntactic forms
@@ -1872,15 +1936,15 @@ static Expr primary(void) {
         ++pos;
         expect(")");
         Function *fn = &functions[current_function];
-        int tag_off = fn->va_tag_offset;
-        int frame = (max_frame_bytes + 15) & ~15;
+        if (!fn->variadic || macos) error("va_start requires a Linux variadic function");
+        int tag_off = allocate(derived(TY_ARRAY, &char_type, 32));
         int save_end = fn->va_save_offset + 64;
         /* ap = &tag = x29 + tag_off */
         emit("    add x9, x29, #%d\n", tag_off);
         emit("    str x9, [x29, #%d]\n", locals[ap_local].offset);
         emit("    ldr x9, [x29, #%d]\n", locals[ap_local].offset);
         /* tag->stack = x29 + frame (caller's overflow area) */
-        emit("    add x10, x29, #%d\n", frame);
+        emit("    add x10, x29, #.Lframe%zu\n", current_function);
         emit("    str x10, [x9]\n");
         /* tag->gr_top = x29 + save_end (just past x7's slot) */
         emit("    add x10, x29, #%d\n", save_end);
@@ -1890,7 +1954,12 @@ static Expr primary(void) {
         emit("    add x10, x29, #%d\n", fp_end);
         emit("    str x10, [x9, #16]\n");
         /* tag->gr_offset = -8 * (8 - named GP regs), increasing per va_arg. */
-        int gr_off_val = 8 * fn->nparams - 64;
+        int named_gp = 0, named_fp = 0;
+        for (int i = 0; i < fn->nparams; ++i) {
+            if (fn->params[i]->kind == TY_DOUBLE) ++named_fp;
+            else ++named_gp;
+        }
+        int gr_off_val = 8 * named_gp - 64;
         /* sub with an immediate cannot name xzr as its first operand. */
         emit("    sub x10, x10, x10\n");
         if (gr_off_val < 0)
@@ -1898,9 +1967,9 @@ static Expr primary(void) {
         else
             emit("    add x10, x10, #%d\n", gr_off_val);
         emit("    str w10, [x9, #24]\n");
-        /* tag->vr_offset = -128 (all eight FP slots available) */
+        /* Skip the named FP arguments in their 16-byte register-save slots. */
         emit("    sub x10, x10, x10\n");
-        emit("    sub x10, x10, #128\n");
+        emit("    sub x10, x10, #%d\n", 128 - named_fp * 16);
         emit("    str w10, [x9, #28]\n");
         return (Expr){&void_type, 0, -1, 1};
     }
@@ -1928,19 +1997,14 @@ static Expr primary(void) {
         if (src_local < 0) error("va_copy source must be a local variable");
         ++pos;
         expect(")");
-        /* *dst = *src — copy the 40-byte __va_list_tag */
-        emit("    add x9, x29, #%d\n", locals[src_local].offset);
-        emit("    ldr x10, [x9]\n");
-        emit("    add x9, x29, #%d\n", locals[dst_local].offset);
-        emit("    str x10, [x9]\n");
-        emit("    add x9, x29, #%d\n", locals[src_local].offset);
-        emit("    ldr x10, [x9, #8]\n");
-        emit("    add x9, x29, #%d\n", locals[dst_local].offset);
-        emit("    str x10, [x9, #8]\n");
-        emit("    add x9, x29, #%d\n", locals[src_local].offset);
-        emit("    ldr w10, [x9, #24]\n");
-        emit("    add x9, x29, #%d\n", locals[dst_local].offset);
-        emit("    str w10, [x9, #24]\n");
+        /* Each copy owns an independent 32-byte AAPCS64 cursor. */
+        if (macos) error("va_copy currently requires Linux");
+        int tag_off = allocate(derived(TY_ARRAY, &char_type, 32));
+        emit("    ldr x9, [x29, #%d]\n", locals[src_local].offset);
+        emit("    add x10, x29, #%d\n", tag_off);
+        for (int off = 0; off < 32; off += 8)
+            emit("    ldr x11, [x9, #%d]\n    str x11, [x10, #%d]\n", off, off);
+        emit("    str x10, [x29, #%d]\n", locals[dst_local].offset);
         return (Expr){&void_type, 0, -1, 1};
     }
     if (!strcmp(current()->text, "sizeof")) {
@@ -2048,11 +2112,8 @@ static Expr primary(void) {
                                     idx += to_copy;
                                 } else {
                                     assignment_expr();
-                                    if (wide(bt)) emit("    str x0, [%s]\n", inner_addr);
-                                    else if (bt->kind == TY_INT || bt->kind == TY_UINT || bt->kind == TY_BOOL)
-                                        emit("    str w0, [%s]\n", inner_addr);
-                                    else if (bt->kind == TY_CHAR)
-                                        emit("    strb w0, [%s]\n", inner_addr);
+                                    emit("    add x9, %s\n", inner_addr);
+                                    store_value(bt, "x9");
                                     ++idx;
                                 }
                                 if (!take(",")) break;
@@ -2075,21 +2136,8 @@ static Expr primary(void) {
                             char inner_addr[32];
                             snprintf(inner_addr, sizeof(inner_addr),
                                      "x29, #%d", moff);
-                            if (to->members[m].type->kind == TY_PTR ||
-                                to->members[m].type->kind == TY_LONG ||
-                                to->members[m].type->kind == TY_ULONG) {
-                                emit("    str x0, [%s]\n", inner_addr);
-                            } else if (to->members[m].type->kind == TY_INT ||
-                                       to->members[m].type->kind == TY_UINT ||
-                                       to->members[m].type->kind == TY_BOOL) {
-                                emit("    str w0, [%s]\n", inner_addr);
-                            } else if (to->members[m].type->kind == TY_CHAR) {
-                                emit("    strb w0, [%s]\n", inner_addr);
-                            } else if (to->members[m].type->kind == TY_ARRAY) {
-                                error("nested array compound literals are not supported");
-                            } else {
-                                emit("    str x0, [%s]\n", inner_addr);
-                            }
+                            emit("    add x9, %s\n", inner_addr);
+                            store_value(to->members[m].type, "x9");
                             (void)msize;
                         }
                     }
@@ -2123,12 +2171,8 @@ static Expr primary(void) {
                             char inner_addr[32];
                             snprintf(inner_addr, sizeof(inner_addr),
                                      "x29, #%d", moff);
-                            if (to->base->kind == TY_PTR || to->base->kind == TY_LONG || to->base->kind == TY_ULONG)
-                                emit("    str x0, [%s]\n", inner_addr);
-                            else if (to->base->kind == TY_INT || to->base->kind == TY_UINT || to->base->kind == TY_BOOL)
-                                emit("    str w0, [%s]\n", inner_addr);
-                            else if (to->base->kind == TY_CHAR)
-                                emit("    strb w0, [%s]\n", inner_addr);
+                            emit("    add x9, %s\n", inner_addr);
+                            store_value(to->base, "x9");
                             ++count;
                             if (!take(",")) break;
                             if (!strcmp(current()->text, "}")) break;
@@ -2140,12 +2184,8 @@ static Expr primary(void) {
                     convert(e, to);
                     char inner_addr[32];
                     snprintf(inner_addr, sizeof(inner_addr), "x29, #%d", offset);
-                    if (wide(to)) emit("    str x0, [%s]\n", inner_addr);
-                    else if (to->kind == TY_INT || to->kind == TY_UINT ||
-                             to->kind == TY_BOOL)
-                        emit("    str w0, [%s]\n", inner_addr);
-                    else if (to->kind == TY_CHAR)
-                        emit("    strb w0, [%s]\n", inner_addr);
+                    emit("    add x9, %s\n", inner_addr);
+                    store_value(to, "x9");
                 }
                 if (!take("}")) error("expected '}' at end of compound literal");
                 /* Place the compound literal's address in x0 so the value()/
@@ -2157,6 +2197,11 @@ static Expr primary(void) {
             if (to->kind == TY_VOID) {
                 if (operand.type->kind != TY_VOID) value(operand);
                 return (Expr){&void_type, 0, -1, 0};
+            }
+            if (to->kind == TY_PTR &&
+                (operand.type->kind == TY_PTR || operand.type->kind == TY_ARRAY)) {
+                value(operand);
+                return (Expr){to, 0, -1, 0};
             }
             return convert(operand, to);
         }
@@ -2220,38 +2265,16 @@ static Expr primary(void) {
             if (frame_bytes > 4080) error("locals exceed the 4080-byte frame limit");
             if (frame_bytes > max_frame_bytes) max_frame_bytes = frame_bytes;
         }
-        /* Classify arguments before staging: register arguments occupy one or
-           two GP registers (or one FP register for doubles); aggregates
-           larger than sixteen bytes are copied to the stack overflow area.
-           The classification is static because non-variadic arguments are
-           converted to the prototype's parameter types. Variadic calls stage
-           the full eight-register area; every unnamed slot is a scalar. */
-        int slot_of[8];
-        int stack_offsets[8];
-        int reg_count = 0, running_stack = 0, gp_total = 0;
-        for (int i = 0; i < expected; ++i) {
-            Type *pt = fn->params[i];
-            if (pt->kind == TY_DOUBLE) { slot_of[i] = reg_count++; continue; }
-            if (aggregate(pt)) {
-                int s = aggregate_slots(pt);
-                if (s > 0 && gp_total + s <= 8) {
-                    slot_of[i] = reg_count++; gp_total += s;
-                } else {
-                    slot_of[i] = -1;
-                    stack_offsets[i] = running_stack;
-                    running_stack += (pt->size + 7) & ~7;
-                }
-            } else { slot_of[i] = reg_count++; ++gp_total; }
-        }
+        int call_frame = frame_bytes;
+        ArgPlace places[8];
+        int gp_count = 0, fp_count = 0, running_stack = 0;
+        for (int i = 0; i < expected; ++i)
+            places[i] = argument_place(fn->params[i], &gp_count, &fp_count, &running_stack);
         int stack_bytes = (running_stack + 15) & ~15;
-        if (running_stack > 4095)
-            error("aggregate arguments exceed the staging area");
-        /* Unnamed variadic slots stage sequentially in the full area. */
-        if (fn->variadic)
-            for (int i = expected; i < 8; ++i) slot_of[i] = i;
-        int stage = fn->variadic ? 8 : reg_count;
-        if (stage || stack_bytes)
-            emit("    sub sp, sp, #%d\n", stage * 16 + stack_bytes);
+        if (stack_bytes + 128 > 4095) error("arguments exceed staging area");
+        /* One slot holds a scalar or an address of a private aggregate copy. */
+        int stage = 8;
+        emit("    sub sp, sp, #%d\n", stage * 16 + stack_bytes);
         Type *arg_types[8] = {0};
         int count = 0;
         if (!take(")")) {
@@ -2260,27 +2283,24 @@ static Expr primary(void) {
                 if (count < expected) {
                     Type *pt = fn->params[count];
                     convert(assignment_expr(), pt);
-                    if (slot_of[count] >= 0) {
-                        /* Stash the value, or the aggregate's address. */
-                        emit("    str x0, [sp, #%d]\n", slot_of[count] * 16);
-                    } else {
-                        /* Copy the aggregate into the overflow area. */
-                        emit("    add x9, sp, #%d\n", stage * 16 + stack_offsets[count]);
-                        int words = (pt->size + 7) / 8;
-                        for (int w = 0; w < words; ++w) {
-                            emit("    ldr x12, [x0, #%d]\n", w * 8);
-                            emit("    str x12, [x9, #%d]\n", w * 8);
-                        }
+                    if (aggregate(pt)) {
+                        int copy_off = allocate(derived(TY_ARRAY, &char_type, (pt->size + 7) & ~7));
+                        emit("    add x9, x29, #%d\n", copy_off);
+                        copy_object(pt, "x9", "x0");
+                        emit("    add x0, x29, #%d\n", copy_off);
                     }
+                    emit("    str x0, [sp, #%d]\n", count * 16);
                 } else {
                     if (!fn->variadic)
                         error("wrong number of function arguments");
                     /* Default argument promotions for variadic slots. */
                     Expr a = value(assignment_expr());
-                    if (a.type->kind == TY_CHAR) narrow_char();
+                    if (integer(a.type) && a.type->size < 4 && a.type->kind != TY_BOOL) narrow_integer(a.type);
                     else if (a.type->kind == TY_STRUCT || a.type->kind == TY_UNION)
                         error("aggregate arguments are not supported yet");
                     arg_types[count] = promote(a.type);
+                    places[count] = argument_place(arg_types[count], &gp_count, &fp_count, &running_stack);
+                    if (places[count].stack >= 0) error("too many variadic register arguments");
                     /* Unnamed slots stage sequentially in the full area. */
                     emit("    str x0, [sp, #%d]\n", count * 16);
                 }
@@ -2294,30 +2314,43 @@ static Expr primary(void) {
         } else if (count != expected) {
             error("wrong number of function arguments");
         }
-        int gp = 0, fp = 0;
+        /* Prepare overflow storage before loading any argument registers. */
         for (int i = 0; i < count; ++i) {
+            ArgPlace place = places[i];
             Type *type = i < expected ? fn->params[i] : arg_types[i];
-            if (i < expected && slot_of[i] < 0) continue; /* stack argument */
-            if (type->kind == TY_DOUBLE) {
-                emit("    ldr d%d, [sp, #%d]\n", fp++, slot_of[i] * 16);
-            } else if (aggregate(type)) {
-                int s = aggregate_slots(type);
-                emit("    ldr x9, [sp, #%d]\n", slot_of[i] * 16);
-                emit("    ldr x%d, [x9]\n", gp);
-                if (s == 2) emit("    ldr x%d, [x9, #8]\n", gp + 1);
-                gp += s;
+            if (place.stack < 0) continue;
+            emit("    ldr x9, [sp, #%d]\n", i * 16);
+            if (aggregate(type) && !place.indirect) {
+                for (int j = 0; j < type->size; ++j)
+                    emit("    ldrb w10, [x9, #%d]\n    strb w10, [sp, #%d]\n",
+                         j, stage * 16 + place.stack + j);
+            } else emit("    str x9, [sp, #%d]\n", stage * 16 + place.stack);
+        }
+        for (int i = 0; i < count; ++i) {
+            ArgPlace place = places[i];
+            Type *type = i < expected ? fn->params[i] : arg_types[i];
+            if (place.stack >= 0) continue;
+            if (aggregate(type) && !place.indirect) {
+                emit("    ldr x9, [sp, #%d]\n", i * 16);
+                for (int j = 0; j < place.count; ++j)
+                    emit("    ldr %s%d, [x9, #%d]\n", place.fp >= 0 ? "d" : "x",
+                         (place.fp >= 0 ? place.fp : place.gp) + j, j * 8);
             } else {
                 emit("    ldr %s%d, [sp, #%d]\n",
-                     wide(type) ? "x" : "w", gp++, slot_of[i] * 16);
+                     place.fp >= 0 ? "d" : (wide(type) || place.indirect) ? "x" : "w",
+                     place.fp >= 0 ? place.fp : place.gp, i * 16);
             }
         }
         if (stage) emit("    add sp, sp, #%d\n", stage * 16);
-        if (aggregate(fn->result) && fn->result->size > 16)
+        if (indirect_aggregate(fn->result))
             emit("    add x8, x29, #%d\n", result_off);
         emit("    bl %s%s\n", fn->internal ? ".L" : macos ? "_" : "", s);
         if (stack_bytes) emit("    add sp, sp, #%d\n", stack_bytes);
         if (aggregate(fn->result)) {
-            if (fn->result->size <= 16) {
+            if (hfa_count(fn->result)) {
+                for (int j = 0; j < hfa_count(fn->result); ++j)
+                    emit("    str d%d, [x29, #%d]\n", j, result_off + j * 8);
+            } else if (fn->result->size <= 16) {
                 emit("    str x0, [x29, #%d]\n", result_off);
                 if (fn->result->size > 8)
                     emit("    str x1, [x29, #%d]\n", result_off + 8);
@@ -2325,8 +2358,9 @@ static Expr primary(void) {
             emit("    add x0, x29, #%d\n", result_off);
         } else if (fn->result->kind == TY_DOUBLE)
             emit("    sub sp, sp, #16\n    str d0, [sp]\n    ldr x0, [sp]\n    add sp, sp, #16\n");
-        if (fn->result->kind == TY_CHAR) narrow_char();
+        if (integer(fn->result) && fn->result->size < 4 && fn->result->kind != TY_BOOL) narrow_integer(fn->result);
         else if (fn->result->kind == TY_BOOL) normalize_bool(&int_type);
+        frame_bytes = call_frame;
         return (Expr){fn->result, 0, -1, 0};
     }
     if (local >= 0 && locals[local].offset == -4) {
@@ -3427,20 +3461,24 @@ static void statement(void) {
             if (!strcmp(current()->text, ";")) error("non-void function must return a value");
             convert(expression(), rt);
             if (aggregate(rt)) {
-                if (rt->size > 16) {
+                if (hfa_count(rt)) {
+                    for (int j = 0; j < hfa_count(rt); ++j)
+                        emit("    ldr d%d, [x0, #%d]\n", j, j * 8);
+                } else if (rt->size > 16) {
                     /* x8 held the caller's result buffer; copy bytes there. */
                     emit("    ldr x9, [x29, #%d]\n",
                          functions[current_function].result_ptr_offset);
-                    int words = (rt->size + 7) / 8;
-                    for (int w = 0; w < words; ++w) {
-                        emit("    ldr x12, [x0, #%d]\n", w * 8);
-                        emit("    str x12, [x9, #%d]\n", w * 8);
-                    }
+                    copy_object(rt, "x9", "x0");
                 } else {
-                    /* Small aggregates return in x0 and x1. Load x1 first so
-                       the source address survives the final load. */
-                    if (rt->size > 8) emit("    ldr x1, [x0, #8]\n");
-                    emit("    ldr x0, [x0]\n");
+                    /* Pack only the object's bytes, avoiding an overread of
+                       short or oddly-sized records at a page boundary. */
+                    emit("    sub x9, x0, xzr\n");
+                    for (int reg = 0; reg < (rt->size + 7) / 8; ++reg) {
+                        emit("    sub x%d, x%d, x%d\n", reg, reg, reg);
+                        for (int j = 0; j < 8 && reg * 8 + j < rt->size; ++j)
+                            emit("    ldrb w13, [x9, #%d]\n    add x%d, x%d, x13, lsl #%d\n",
+                                 reg * 8 + j, reg, reg, j * 8);
+                    }
                 }
             }
         }
@@ -3474,7 +3512,7 @@ static void emit_function(size_t start, size_t open, size_t first_constant) {
     const char *prefix = fn->internal ? ".L" : macos ? "_" : "";
     int frame = (max_frame_bytes + 15) & ~15;
     FILE *out = program;
-    fprintf(out, ".text\n.p2align 2\n");
+    fprintf(out, ".text\n.p2align 2\n.set .Lframe%zu, %d\n", current_function, frame);
     if (!fn->internal && !fn->static_linkage) fprintf(out, ".globl %s%s\n", prefix, fn->name);
     if (!macos) fprintf(out, ".type %s%s, %%function\n", prefix, fn->name);
     source_comment(out, start, open);
@@ -3483,8 +3521,8 @@ static void emit_function(size_t start, size_t open, size_t first_constant) {
                  "    str x29, [sp]\n"
                  "    str x30, [sp, #8]\n"
                  "    add x29, sp, #0\n", prefix, fn->name, frame);
-    /* Variadic functions save x0..x7 so va_list can read unnamed args. The
-       save area overlaps the named-parameter slots (x_i = named param i). */
+    /* Save incoming registers before copying named parameters to their own
+       slots. FP and GP argument sequences advance independently. */
     if (fn->variadic) {
         int save_off = fn->va_save_offset;
         for (int i = 0; i < 8; ++i)
@@ -3501,34 +3539,24 @@ static void emit_function(size_t start, size_t open, size_t first_constant) {
     for (int i = 0; i < fn->nparams; ++i) {
         Type *pt = fn->params[i];
         int off = locals[i].offset;
-        if (pt->kind == TY_DOUBLE) {
-            fprintf(out, "    str d%d, [x29, #%d]\n", fp++, off);
-        } else if (aggregate(pt)) {
-            int slots = aggregate_slots(pt);
-            if (slots == 1) {
-                fprintf(out, "    str x%d, [x29, #%d]\n", gp++, off);
-            } else if (slots == 2) {
-                fprintf(out, "    str x%d, [x29, #%d]\n", gp, off);
-                fprintf(out, "    str x%d, [x29, #%d]\n", gp + 1, off + 8);
-                gp += 2;
-            } else {
-                /* Larger than 16 bytes: the caller copied the bytes into the
-                   stack overflow area. Walk cumulative offsets so multiple
-                   stack arguments line up with the caller's layout. */
-                int words = (pt->size + 7) / 8;
+        ArgPlace place = argument_place(pt, &gp, &fp, &stack_running);
+        if (place.indirect || place.stack >= 0) {
+            if (place.stack >= 0) {
                 fprintf(out, "    add x9, x29, #%d\n", frame);
-                if (stack_running)
-                    fprintf(out, "    add x9, x9, #%d\n", stack_running);
-                fprintf(out, "    add x10, x29, #%d\n", off);
-                for (int w = 0; w < words; ++w)
-                    fprintf(out, "    ldr x12, [x9, #%d]\n"
-                                 "    str x12, [x10, #%d]\n", w * 8, w * 8);
-                stack_running += (pt->size + 7) & ~7;
-            }
+                if (place.stack) fprintf(out, "    add x9, x9, #%d\n", place.stack);
+                if (place.indirect) fprintf(out, "    ldr x9, [x9]\n");
+            } else fprintf(out, "    sub x9, x%d, xzr\n", place.gp);
+            for (int j = 0; j < pt->size; ++j)
+                fprintf(out, "    ldrb w12, [x9, #%d]\n    strb w12, [x29, #%d]\n", j, off + j);
+        } else if (aggregate(pt)) {
+            for (int j = 0; j < place.count; ++j)
+                fprintf(out, "    str %s%d, [x29, #%d]\n", place.fp >= 0 ? "d" : "x",
+                        (place.fp >= 0 ? place.fp : place.gp) + j, off + j * 8);
         } else {
             fprintf(out, "    %s %s%d, [x29, #%d]\n",
-                    pt->kind == TY_CHAR || pt->kind == TY_BOOL ? "strb" : "str",
-                    wide(pt) ? "x" : "w", gp++, off);
+                    pt->size == 1 ? "strb" : "str",
+                    place.fp >= 0 ? "d" : wide(pt) ? "x" : "w",
+                    place.fp >= 0 ? place.fp : place.gp, off);
         }
     }
     if (fflush(body) || fseek(body, 0, SEEK_SET)) fatal("cannot rewind assembly buffer");
@@ -3667,10 +3695,9 @@ static void parse(void) {
                overlaps named-parameter slots (x_i = named param i). */
             if (variadic) {
                 functions[index].va_save_offset = 16;
-                functions[index].va_tag_offset = 16 + 64;
-                functions[index].fp_save_offset = 16 + 64 + 40;
+                functions[index].fp_save_offset = 16 + 64;
                 int overhead = functions[index].fp_save_offset + 128;
-                if (overhead > (int)max_frame_bytes) max_frame_bytes = overhead;
+                frame_bytes = max_frame_bytes = overhead;
             }
             global_scope = 0;
             for (int i = 0; i < nparams; ++i) {
@@ -3690,7 +3717,7 @@ static void parse(void) {
             /* Functions returning aggregates larger than sixteen bytes use
                the x8 indirect-result convention: reserve a slot to hold the
                caller's buffer address across the body. */
-            if (aggregate(result) && result->size > 16)
+            if (indirect_aggregate(result))
                 functions[index].result_ptr_offset = allocate(&long_type);
             body = tmpfile();
             if (!body) fatal("cannot create assembly buffer: %s", strerror(errno));
@@ -3819,10 +3846,12 @@ static void parse(void) {
                     switch (t->kind) {
                     case TY_PTR: case TY_ULONG: case TY_LONG: case TY_DOUBLE:
                         cursor += 8; break;
-                    case TY_INT: case TY_UINT: case TY_BOOL:
+                    case TY_INT: case TY_UINT:
                         cursor += 4; break;
-                    case TY_CHAR:
+                    case TY_BOOL: case TY_CHAR: case TY_SCHAR: case TY_UCHAR:
                         cursor += 1; break;
+                    case TY_SHORT: case TY_USHORT:
+                        cursor += 2; break;
                     default:
                         cursor += 4; break;
                     }

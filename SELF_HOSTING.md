@@ -61,7 +61,7 @@ cc /tmp/stage3.s -o /tmp/stage3
 cmp /tmp/stage3.s /tmp/stage4.s                                  # converges
 ```
 
-The self-built compiler passes the full regression suite (106 tests, including
+The self-built compiler passes the full regression suite (111 tests, including
 unchanged-source Dhrystone with real and controlled clocks) and its own object
 code audits clean against the twelve-mnemonic whitelist under
 `objdump -d -M no-aliases`. Bugs fixed along the way: callee-side stack-argument
@@ -70,6 +70,17 @@ offsets now walk cumulative byte offsets, `va_start` uses the correct
 every slice including the original commas, and global aggregate initializers
 are laid out at true member offsets so inter-member padding is preserved.
 Bootstrap convergence is necessary, but not sufficient proof of correctness.
+
+The post-bootstrap review fixes are covered by cross-compiler tests in both
+directions: indirect large-aggregate arguments, homogeneous double aggregates
+and their results, and register exhaustion. Variadic cursor copies are checked
+with independent GP/FP save positions and stack-passed arguments. The fixed-width
+integer headers now use real signed/unsigned byte and 16-bit types, and macro
+arguments are expanded before substitution except at stringification/pasting
+sites. Stringification preserves token spelling and whitespace after expansion.
+The normal, sanitizer and self-built compiler suites and bootstrap convergence
+were rerun after these fixes; the generated compiler object retains the
+twelve-mnemonic instruction vocabulary.
 
 Each language feature has small executable regression examples and retains
 explanatory emitted assembly. ABI changes were compared with system-compiled

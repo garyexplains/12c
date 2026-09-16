@@ -18,7 +18,7 @@ static const char *asm_branch_reason(const char *label) {
     if (asm_starts(label, ".Lcmp") || asm_starts(label, ".Lpeq") || asm_starts(label, ".Lpend"))
         return "select the comparison result without condition flags";
     if (asm_starts(label, ".Lchar") || asm_starts(label, ".Lc9"))
-        return "handle the sign of a byte-sized character";
+        return "handle the sign of a narrow integer";
     if (asm_starts(label, ".Land") || asm_starts(label, ".Lor"))
         return "implement short-circuit logic, evaluating the right side only when needed";
     if (asm_starts(label, ".Lbool")) return "normalize a scalar to C's boolean values 0 and 1";

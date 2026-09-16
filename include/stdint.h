@@ -1,13 +1,10 @@
-/* Controlled <stdint.h> for 4c. Both supported AArch64 targets use LP64, so
-   long and unsigned long are 64 bits. The compiler does not support short,
-   long long; 16-bit type support still needs correction. Integer constant
-   macros use token pasting to select the appropriate literal type. */
-typedef char int8_t;
-typedef int int16_t;
+/* Exact-width integer types for the supported AArch64 LP64 targets. */
+typedef signed char int8_t;
+typedef short int16_t;
 typedef int int32_t;
 typedef long int64_t;
 typedef unsigned char uint8_t;
-typedef unsigned int uint16_t;
+typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
 typedef unsigned long uint64_t;
 typedef long intptr_t;

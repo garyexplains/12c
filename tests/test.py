@@ -846,6 +846,141 @@ class CompilerTests(unittest.TestCase):
             int main(){(void)bump();(void)n++;return n!=2;}
         """)
 
+    @unittest.skipUnless(NATIVE and TARGET == "linux", "requires Linux AArch64")
+    def test_review_aggregate_system_abi(self):
+        types = '''
+            struct Big {long a,b,c;};
+            struct Pair {double a,b;};
+            struct Quad {struct Pair a,b;};
+            struct Words {long a,b;};
+        '''
+        self.execute(types + '''
+            long foreign(struct Big s,long n);
+            struct Big change(struct Big s,long n){s.b+=n;return s;}
+            long outbound(struct Big s,long n){return foreign(s,n)+s.a;}
+            struct Pair pair(struct Pair p){return p;}
+            struct Quad quad(struct Quad p){return p;}
+            long spill(long a,long b,long c,long d,long e,long f,long g,struct Words w){
+                return a+b+c+d+e+f+g+w.a+w.b;
+            }
+            struct Pair fp_spill(struct Quad a,struct Quad b,struct Pair c){return c;}
+            int verify(void);
+            int main(){return verify();}
+        ''', helper=types + '''
+            long foreign(struct Big s,long n){long r=s.a+s.b+s.c+n;s.a=99;return r;}
+            struct Big change(struct Big,long);
+            long outbound(struct Big,long);
+            struct Pair pair(struct Pair);
+            struct Quad quad(struct Quad);
+            long spill(long,long,long,long,long,long,long,struct Words);
+            struct Pair fp_spill(struct Quad,struct Quad,struct Pair);
+            int verify(void){
+                struct Big s={1,2,3},t=change(s,9);
+                if(t.a!=1||t.b!=11||t.c!=3||s.b!=2)return 1;
+                if(outbound(s,9)!=16)return 2;
+                struct Pair p=pair((struct Pair){1.25,2.5});
+                if(p.a!=1.25||p.b!=2.5)return 3;
+                struct Quad q=quad((struct Quad){{1,2},{3,4}});
+                if(q.a.a!=1||q.a.b!=2||q.b.a!=3||q.b.b!=4)return 4;
+                if(spill(1,2,3,4,5,6,7,(struct Words){8,9})!=45)return 5;
+                p=fp_spill(q,q,(struct Pair){5,6});
+                return p.a!=5||p.b!=6;
+            }
+        ''', helper_c=True)
+        # The reverse direction also exercises FP and GP register exhaustion.
+        self.execute(types + '''
+            struct Pair pair(struct Pair p);
+            struct Quad quad(struct Quad p);
+            struct Pair fp_spill(struct Quad a,struct Quad b,struct Pair c);
+            long spill(long a,long b,long c,long d,long e,long f,long g,struct Words w);
+            int check(struct Pair p,struct Quad q);
+            int main(){
+                struct Pair p;p.a=1.25;p.b=2.5;
+                struct Quad q;q.a.a=1;q.a.b=2;q.b.a=3;q.b.b=4;
+                struct Words w;w.a=8;w.b=9;
+                if(spill(1,2,3,4,5,6,7,w)!=45)return 1;
+                p=pair(p);q=quad(q);p=fp_spill(q,q,p);
+                return check(p,q);
+            }
+        ''',helper=types+'''
+            struct Pair pair(struct Pair p){return p;}
+            struct Quad quad(struct Quad p){return p;}
+            struct Pair fp_spill(struct Quad a,struct Quad b,struct Pair c){return c;}
+            long spill(long a,long b,long c,long d,long e,long f,long g,struct Words w){return a+b+c+d+e+f+g+w.a+w.b;}
+            int check(struct Pair p,struct Quad q){return p.a!=1.25||p.b!=2.5||q.a.a!=1||q.b.b!=4;}
+        ''',helper_c=True)
+
+    @unittest.skipUnless(NATIVE and TARGET == "linux", "requires Linux AArch64")
+    def test_review_va_copy_independent_cursors(self):
+        self.execute_against_system('''
+            #include <stdio.h>
+            #include <stdarg.h>
+            void show(double named,char *fmt,...){
+                va_list a;va_list b;va_list c;
+                va_start(a,fmt);va_copy(b,a);va_copy(c,b);
+                int later[32];later[31]=99;
+                vfprintf(stdout,fmt,a);vfprintf(stdout,fmt,b);vfprintf(stdout,fmt,c);
+                va_end(c);va_end(b);va_end(a);
+                printf("%d\\n",later[31]);
+            }
+            int main(){show(3.0,"%d %.2f %s\\n",11,1.25,"ok");return 0;}
+        ''')
+
+    @unittest.skipUnless(NATIVE and TARGET == "linux", "requires Linux AArch64")
+    def test_review_va_copy_stack_arguments(self):
+        self.execute("""
+            #include <stdio.h>
+            #include <stdarg.h>
+            void show(char *fmt,...){
+                va_list a;va_list b;va_start(a,fmt);va_copy(b,a);
+                int later[64];later[63]=42;
+                vfprintf(stdout,fmt,a);vfprintf(stdout,fmt,b);
+                printf("%d\\n",later[63]);va_end(b);va_end(a);
+            }
+            void invoke(void);int main(){invoke();return 0;}
+        """, b"1 2 3 4 5 6 7 8 9 10\n1 2 3 4 5 6 7 8 9 10\n42\n", helper="""
+            void show(char *,...);
+            void invoke(void){show("%d %d %d %d %d %d %d %d %d %d\\n",1,2,3,4,5,6,7,8,9,10);}
+        """,helper_c=True)
+
+    @unittest.skipUnless(NATIVE, "requires native AArch64")
+    def test_review_exact_width_integer_storage(self):
+        self.execute_against_system('''
+            #include <stdint.h>
+            #include <stdio.h>
+            int16_t global[3]={-1,32767,-32768};
+            uint16_t unsigned_global[2]={65535,1234};
+            struct Packed {int8_t a;int16_t b;uint8_t c;};
+            int16_t echo(int16_t x){return x;}
+            int main(){
+                int16_t a[3]={-1,32767,-32768};
+                struct Packed s;s.a=-1;s.b=-1234;s.c=255;
+                s.b=echo(s.b);
+                printf("%lu %lu %lu %d %d %u\\n",sizeof(int8_t),sizeof(int16_t),sizeof(uint16_t),s.a,s.b,s.c);
+                printf("%d %d %d %u %u\\n",global[0],global[1],global[2],unsigned_global[0],unsigned_global[1]);
+                a[0]++;a[1]=-7;
+                s=(struct Packed){-2,-123,254};
+                printf("%d %d %d %d %d %u\\n",a[0],a[1],a[2],s.a,s.b,s.c);
+                return 0;
+            }
+        ''')
+
+    @unittest.skipUnless(NATIVE, "requires native AArch64")
+    def test_review_macro_argument_prescan(self):
+        self.execute_against_system('''
+            #include <stdio.h>
+            #define F(x) x+x
+            #define A F
+            #define RAW(x) #x
+            #define EXPAND(x) RAW(x)
+            #define JOIN(a,b) a ## b
+            #define FORWARD(...) F(__VA_ARGS__)
+            int main(){int Aname=9;
+                printf("%d %d %s %s %d\\n",F(A(1)),F(F(2)),RAW(A(1)),EXPAND(A(1)),JOIN(A,name));
+                return FORWARD(A(1))!=4;
+            }
+        ''')
+
     def test_conditional_operand_diagnostics(self):
         for source in (
             "int main(){int a;char b;int *p=1?&a:&b;return 0;}",

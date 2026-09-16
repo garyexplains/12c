@@ -1,14 +1,13 @@
 #ifndef FOUR_C_STDARG_H
 #define FOUR_C_STDARG_H
-/* Controlled <stdarg.h> for 4c. The va_list type follows the AArch64 AAPCS:
-   a pointer to __va_list_tag. Variadic function definitions save x0..x7 to
-   a known offset in their frame; va_start initializes a __va_list_tag in the
-   frame so libc's vfprintf can read unnamed arguments. */
+/* The compiler represents va_list as a pointer to a private, 32-byte Linux
+   AAPCS64 cursor. va_start and va_copy allocate independent cursor storage.
+   The generated variadic prologue saves GP and FP registers separately. */
 typedef struct __va_list_tag {
     void *stack;     /* next overflow stack argument in the caller's frame */
     void *gr_top;    /* top of saved GP regs (just past x7 slot) */
     void *vr_top;    /* top of saved FP/vector regs */
-    int gr_offset;   /* -N-1 where N is named GP regs; consumed by vfprintf */
+    int gr_offset;   /* -8 * remaining saved GP register slots */
     int vr_offset;
 } __va_list_tag;
 
