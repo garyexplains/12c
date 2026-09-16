@@ -14,14 +14,15 @@ assembly, as in the listings.
 
 `LDR` is how the program reads: variable values, saved registers, pointers, and
 64-bit double bit patterns. Crucially, it also loads *literal constants* —
-since there is no `MOV` immediate, every constant in the program (even plain
+AArch64 does have immediate-move instructions (`MOVZ`/`MOVN`), but they are not
+among the twelve allowed names, so every constant in the program (even plain
 `0` or `65`) lives in a literal pool of `.word` values placed after the
 function, and `LDR` fetches it. The destination register's width selects the
 access: `w0` loads 32 bits, `x0` loads 64, and `d0` loads the 8 raw bytes of a
 double.
 
 ```asm
-// int a = 65; — the constant comes from a literal pool, not a MOV
+// int a = 65; — the constant comes from a literal pool, not a MOVZ
 ldr w0, .LC0      // Load the word 65 into w0; obtain the constant bits.
 ```
 ```asm
